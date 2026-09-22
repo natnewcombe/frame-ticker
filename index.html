@@ -277,6 +277,27 @@
     opacity:0;transition:opacity .3s;pointer-events:none;
   }
   #zoomHint.show{opacity:1;}
+  #pageTagRow{
+    position:absolute;top:12px;left:12px;
+    display:flex;gap:6px;flex-wrap:wrap;max-width:60%;
+  }
+  .tag-chip{
+    display:inline-block;padding:5px 12px;border-radius:8px;
+    font-size:12.5px;font-weight:800;letter-spacing:.03em;
+    color:#fff;box-shadow:0 2px 6px rgba(0,0,0,.35);
+  }
+  .tag-weld{background:#C2483C;}
+  .tag-weld-all{background:#C2483C;}
+  .tag-weld-part{background:#D97A3F;}
+  .tag-weld-stp{background:#A65C3A;}
+  .tag-weld-shs{background:#8E4A5E;}
+  .tag-gusset{background:#3E6E8E;}
+  .tag-stp{background:#8E6E3E;}
+  .tag-shs{background:#5E5A9E;}
+  .tag-double-screw{background:#3E8E6E;}
+  .tag-girder{background:#4A4744;}
+  .page-grid .tag-chips{display:flex;gap:3px;flex-wrap:wrap;justify-content:center;margin-top:2px;}
+  .page-grid .tag-chip{padding:2px 6px;font-size:9.5px;border-radius:5px;}
   .page-grid{
     display:grid;grid-template-columns:repeat(3,1fr);gap:10px;
     max-height:55vh;overflow-y:auto;padding:4px 2px;
@@ -395,6 +416,7 @@
     <div class="screen" id="screen-drawings">
       <div id="drawingsViewport">
         <canvas id="drawingCanvas"></canvas>
+        <div id="pageTagRow"></div>
         <div id="zoomHint">Pinch to zoom &bull; double-tap to reset</div>
       </div>
       <div id="drawingsToolbar">
@@ -452,7 +474,7 @@
 <div id="modalOverlay">
   <div id="modalSheet">
     <h2 id="modalTitle">Pick a file</h2>
-    <input type="text" id="modalSearchInput" placeholder="Search drawing number..." autocomplete="off" style="display:none;margin-bottom:12px;">
+    <input type="text" id="modalSearchInput" placeholder="Search drawing number or tag..." autocomplete="off" style="display:none;margin-bottom:12px;">
     <div id="modalList"></div>
     <button class="btn outline" style="margin-top:10px;" onclick="closeModal()">Cancel</button>
   </div>
@@ -702,22 +724,83 @@ async function extractDetailerReport(pdfDoc){
   return { header, frames };
 }
 
-// Reads the "Drawing Number" printed in each drawing page's title block.
-// On these Austruss title blocks it reliably appears as the token right
-// after the fixed office phone number, regardless of layout variations.
+// Reads the "Drawing Number" / frame mark printed on each drawing page, and
+// the fabrication tags called out there — matching the F_Welding,
+// F_Gusset Plate, F_STP, F_SHS flags already tracked per work order in
+// Smartsheet, plus DOUBLE SCREW and GIRDER.
+//
+// Two known Austruss export templates, tried in order per page:
+//  - FRAMECAD Detailer (panels/beams): the number sits right next to the
+//    office phone number, but which SIDE depends on the sub-template
+//    ("...DWG FILE: 02 4860 1416 BE1003..." vs "...150 - PANELS BE3003 02
+//    4860 1400..."), so both sides are checked.
+//  - FRAMECAD Structure (wall studs): "...Mark as N237 Stud Status..." —
+//    the number follows "Mark as" directly.
+// If Austruss starts using a third export style, add another strategy here
+// rather than replacing these — most jobs will keep using the existing two.
+const DRAWING_NUMBER_TOKEN_RE = /^[A-Z]{1,6}\d{2,6}$/;
+
+function extractDrawingNumber_PhoneAnchor(tokens){
+  for(let i = 0; i < tokens.length - 2; i++){
+    if(tokens[i] === '02' && tokens[i+1] === '4860' && /^1\d{3}$/.test(tokens[i+2])){
+      const after = tokens[i+3];
+      const before = tokens[i-1];
+      if(after && DRAWING_NUMBER_TOKEN_RE.test(after)) return after.toUpperCase();
+      if(before && DRAWING_NUMBER_TOKEN_RE.test(before)) return before.toUpperCase();
+    }
+  }
+  return null;
+}
+
+function extractDrawingNumber_MarkAs(tokens){
+  for(let i = 0; i < tokens.length - 2; i++){
+    if(tokens[i].toLowerCase() === 'mark' && tokens[i+1].toLowerCase() === 'as' && DRAWING_NUMBER_TOKEN_RE.test(tokens[i+2])){
+      return tokens[i+2].toUpperCase();
+    }
+  }
+  return null;
+}
+
+function extractDrawingNumberFromTokens(tokens){
+  return extractDrawingNumber_PhoneAnchor(tokens) || extractDrawingNumber_MarkAs(tokens);
+}
+
+// WELD ALL and WELD PART are mutually exclusive (a frame is one or the
+// other); WELD STP and WELD SHS are their own distinct notes, not the same
+// thing as the standalone STP / SHS tags. GUSSET, STP, SHS, DOUBLE SCREW
+// and GIRDER are independent and any subset can appear together.
+function extractTags(text){
+  const tags = [];
+  const weldModifier = text.match(/\bWELD\s+(ALL|PART|STP|SHS)\b/);
+  if(weldModifier){
+    tags.push('WELD ' + weldModifier[1]);
+  } else if(/\bWELD\b/.test(text)){
+    tags.push('WELD');
+  }
+  if(/\bGUSSET\b/.test(text)) tags.push('GUSSET');
+  if(/\bSTP\b/.test(text)) tags.push('STP');
+  if(/\bSHS\b/.test(text)) tags.push('SHS');
+  if(/\bDOUBLE\s+SCREW\b/.test(text)) tags.push('DOUBLE SCREW');
+  if(/\bGIRDER\b/.test(text)) tags.push('GIRDER');
+  return tags;
+}
+
+// Re-scans every page from scratch each time a job's drawings PDF loads —
+// nothing here is cached across jobs or reused from a prior parse.
 async function buildDrawingIndex(pdfDoc){
   const pages = [];
-  const anchorRe = /02\s*4860\s*1416\s+([A-Za-z0-9]{3,15})\b/;
   for(let p = 1; p <= pdfDoc.numPages; p++){
     let drawingNumber = null;
+    let tags = [];
     try{
       const page = await pdfDoc.getPage(p);
       const content = await page.getTextContent();
       const text = content.items.map(i => i.str).join(' ');
-      const m = text.match(anchorRe);
-      if(m) drawingNumber = m[1].toUpperCase();
+      const tokens = text.split(/\s+/).filter(Boolean);
+      drawingNumber = extractDrawingNumberFromTokens(tokens);
+      tags = extractTags(text);
     }catch(e){ /* leave this page unindexed rather than fail the whole scan */ }
-    pages.push({ page: p, drawingNumber });
+    pages.push({ page: p, drawingNumber, tags });
   }
   return pages;
 }
@@ -976,7 +1059,14 @@ async function loadJobFiles(detailerAtt, drawingsAtt){
   // Runs in the background — the report tab is usable immediately, and the
   // jump/search modal just awaits this promise if it isn't done yet.
   AppState.drawingIndexPromise = buildDrawingIndex(AppState.drawingsPdf)
-    .then(pages => { AppState.drawingPages = pages; });
+    .then(pages => {
+      AppState.drawingPages = pages;
+      // If the operator is already looking at the drawings tab, the tag
+      // chips for the current page won't have had data yet — refresh once.
+      if(document.getElementById('screen-drawings').classList.contains('active')){
+        updatePageTagRow();
+      }
+    });
 
   setTabbarVisible(true);
   setActiveTab('report');
@@ -1118,6 +1208,21 @@ async function renderDrawingPage(){
     'Page ' + AppState.drawingsPage + ' / ' + AppState.drawingsPageCount;
   document.getElementById('btnPagePrev').disabled = AppState.drawingsPage <= 1;
   document.getElementById('btnPageNext').disabled = AppState.drawingsPage >= AppState.drawingsPageCount;
+
+  updatePageTagRow();
+}
+
+function tagSlug(t){
+  return t.toLowerCase().replace(/\s+/g, '-');
+}
+
+function updatePageTagRow(){
+  const row = document.getElementById('pageTagRow');
+  const entry = AppState.drawingPages.find(p => p.page === AppState.drawingsPage);
+  const tags = entry ? entry.tags : [];
+  row.innerHTML = tags.map(t =>
+    '<span class="tag-chip tag-' + tagSlug(t) + '">' + t + '</span>'
+  ).join('');
 }
 
 function applyZoom(){
@@ -1165,10 +1270,14 @@ function renderPageGrid(term){
 
   const pages = AppState.drawingPages.length
     ? AppState.drawingPages
-    : Array.from({length: AppState.drawingsPageCount}, (_, i) => ({page: i+1, drawingNumber: null}));
+    : Array.from({length: AppState.drawingsPageCount}, (_, i) => ({page: i+1, drawingNumber: null, tags: []}));
 
   const matches = term
-    ? pages.filter(p => (p.drawingNumber && p.drawingNumber.includes(term)) || String(p.page) === term)
+    ? pages.filter(p =>
+        (p.drawingNumber && p.drawingNumber.includes(term)) ||
+        String(p.page) === term ||
+        (p.tags || []).some(t => t.includes(term))
+      )
     : pages;
 
   if(!matches.length){
@@ -1179,9 +1288,13 @@ function renderPageGrid(term){
   matches.forEach(p => {
     const btn = document.createElement('button');
     if(p.page === AppState.drawingsPage) btn.classList.add('current');
+    const tagChips = (p.tags && p.tags.length)
+      ? '<span class="tag-chips">' + p.tags.map(t => '<span class="tag-chip tag-' + tagSlug(t) + '">' + t + '</span>').join('') + '</span>'
+      : '';
     btn.innerHTML =
       '<span class="dnum">' + escapeHtml(p.drawingNumber || ('Pg ' + p.page)) + '</span>' +
-      (p.drawingNumber ? '<span class="pnum">Page ' + p.page + '</span>' : '');
+      (p.drawingNumber ? '<span class="pnum">Page ' + p.page + '</span>' : '') +
+      tagChips;
     btn.addEventListener('click', () => { closeModal(); goToDrawingPage(p.page); });
     listEl.appendChild(btn);
   });
