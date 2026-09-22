@@ -178,12 +178,24 @@
   }
   .job-card .wo-id{
     font-size:15px;font-weight:800;letter-spacing:.02em;
-    color:#fff;
+    color:#fff;flex-shrink:0;
   }
+  .job-card .link-btn{
+    background:rgba(255,255,255,.12);color:#fff;border:none;
+    border-radius:8px;padding:6px 10px;font-size:12px;font-weight:700;
+    flex:1;text-align:center;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  }
+  .job-card .link-btn:active{background:rgba(255,255,255,.25);}
   .job-card .card-body{padding:16px;}
   .job-card .zone{font-size:20px;font-weight:800;line-height:1.25;color:var(--text);}
-  .job-card .meta{font-size:14px;color:var(--muted);margin-top:8px;display:flex;flex-wrap:wrap;gap:12px;}
+  .job-card .meta{font-size:14px;color:var(--muted);margin-top:8px;display:flex;flex-wrap:wrap;align-items:center;gap:12px;}
   .job-card .meta b{color:var(--text);font-weight:700;}
+  .gauge-chip{
+    display:inline-flex;align-items:center;justify-content:center;
+    min-width:34px;height:26px;padding:0 8px;
+    border-radius:7px;background:var(--charcoal);color:#fff;
+    font-size:13px;font-weight:800;
+  }
   .badge{
     display:inline-block;padding:4px 12px;border-radius:20px;
     font-size:12px;font-weight:800;text-transform:uppercase;letter-spacing:.03em;
@@ -194,6 +206,18 @@
   /* ---------- Report tab ---------- */
   #reportHeader{
     position:sticky;top:0;z-index:5;
+  }
+  #sessionBar{
+    padding:10px 14px;background:var(--charcoal);
+    border-bottom:1px solid #000;
+  }
+  #btnStartJob{
+    width:100%;min-height:48px;border:none;border-radius:11px;
+    background:var(--orange);color:#fff;font-size:15px;font-weight:800;
+  }
+  #btnStartJob:active{background:var(--orange-dark);}
+  #sessionStatus{
+    color:#C9E9CE;font-size:13.5px;font-weight:700;text-align:center;
   }
   #reportSummary{
     display:flex;justify-content:space-between;align-items:center;
@@ -239,6 +263,7 @@
   .frame-row .name{font-size:17px;font-weight:700;}
   .frame-row.done .name{color:var(--muted);text-decoration:line-through;}
   .frame-row .specs{font-size:12.5px;color:var(--muted);margin-top:2px;}
+  .extra-cols{color:var(--charcoal-2);font-weight:600;}
 
   /* ---------- Drawings tab ---------- */
   #screen-drawings.active{display:flex;flex-direction:column;}
@@ -361,6 +386,7 @@
       <div class="brand" id="brandLabel">Frame Checklist</div>
       <div id="jobHeader"></div>
     </div>
+    <button class="icon-btn" id="btnWorkRecord" style="display:none;" title="Open Work Record">&#128279;</button>
     <button class="icon-btn" id="btnSettings">&#9881;</button>
   </div>
 
@@ -400,6 +426,10 @@
     <!-- ===================== REPORT TAB ===================== -->
     <div class="screen" id="screen-report">
       <div id="reportHeader">
+        <div id="sessionBar">
+          <button id="btnStartJob">Start Job</button>
+          <div id="sessionStatus" style="display:none;">Session started <span id="sessionStartedAt"></span></div>
+        </div>
         <div id="reportSummary">
           <div class="count"><span class="n" id="doneCount">0</span> / <span id="totalCount">0</span> frames done</div>
           <button class="btn" style="width:auto;min-height:40px;padding:0 16px;font-size:13px;" id="btnSaveProgress">Save Progress</button>
@@ -514,6 +544,20 @@ const Store = {
   },
   setJobState(rowId, state){
     localStorage.setItem('fc_job_'+rowId, JSON.stringify(state));
+  },
+
+  // An in-progress (not yet saved) session: when it started, and which
+  // frames were already done at that point. Survives app reload so a
+  // forgotten tab doesn't silently lose the session start time.
+  getSessionStart(rowId){
+    try{ return JSON.parse(localStorage.getItem('fc_session_'+rowId) || 'null'); }
+    catch(e){ return null; }
+  },
+  setSessionStart(rowId, data){
+    localStorage.setItem('fc_session_'+rowId, JSON.stringify(data));
+  },
+  clearSessionStart(rowId){
+    localStorage.removeItem('fc_session_'+rowId);
   }
 };
 
@@ -549,6 +593,69 @@ async function ssGet(path){
   const body = await res.json().catch(()=> ({}));
   if(!res.ok) throw new Error('Smartsheet error ' + res.status + ': ' + (body.message || body.error || JSON.stringify(body).slice(0,150)));
   return body;
+}
+
+// POST/PUT JSON to Smartsheet via the proxy — used for writing session log rows.
+async function ssWrite(path, method, jsonBody){
+  const workerUrl = Store.getWorkerUrl();
+  if(!workerUrl) throw new Error('Worker URL not set');
+  let res;
+  try{
+    res = await fetch(workerUrl + '/api' + path, {
+      method,
+      headers: { 'X-App-Key': Store.getAppKey(), 'Content-Type': 'application/json' },
+      body: JSON.stringify(jsonBody)
+    });
+  }catch(e){
+    throw new Error('Could not reach the proxy at ' + workerUrl + ' (' + e.message + ')');
+  }
+  const body = await res.json().catch(()=> ({}));
+  if(!res.ok) throw new Error('Smartsheet error ' + res.status + ': ' + (body.message || body.error || JSON.stringify(body).slice(0,150)));
+  return body;
+}
+
+// Session log storage: Supabase, called directly from the browser (its
+// REST API sends proper CORS headers, unlike Smartsheet's — no need to
+// route this through the Cloudflare Worker). RLS on the session_log table
+// restricts the anon/publishable key to select + insert only.
+const SUPABASE_URL = 'https://vrhapkrtbxcccmbnjkco.supabase.co';
+const SUPABASE_ANON_KEY = 'sb_publishable_i-ed9yHRmRJWywa5PqEMuQ_INMTnrrl';
+
+function supabaseHeaders(extra){
+  return Object.assign({
+    'apikey': SUPABASE_ANON_KEY,
+    'Authorization': 'Bearer ' + SUPABASE_ANON_KEY
+  }, extra || {});
+}
+
+// Inserts one row into session_log. fields keys must match the table's
+// column names exactly (work_order_id, zone, session_start, etc.).
+async function addSessionLogRow(fields){
+  const res = await fetch(SUPABASE_URL + '/rest/v1/session_log', {
+    method: 'POST',
+    headers: supabaseHeaders({ 'Content-Type': 'application/json', 'Prefer': 'return=minimal' }),
+    body: JSON.stringify(fields)
+  });
+  if(!res.ok){
+    const body = await res.text().catch(()=> '');
+    throw new Error('Session log save failed (' + res.status + '): ' + body.slice(0,200));
+  }
+}
+
+// Fetches every session log row's work_order_id and counts sessions per job.
+async function getSessionCounts(){
+  try{
+    const res = await fetch(SUPABASE_URL + '/rest/v1/session_log?select=work_order_id', {
+      headers: supabaseHeaders()
+    });
+    if(!res.ok) return {};
+    const rows = await res.json();
+    const counts = {};
+    rows.forEach(r => { if(r.work_order_id) counts[r.work_order_id] = (counts[r.work_order_id] || 0) + 1; });
+    return counts;
+  }catch(e){
+    return {}; // don't let a session-log hiccup break the whole job list
+  }
 }
 
 // Download attachment bytes — proxy resolves the 60-second pre-signed URL
@@ -609,16 +716,22 @@ async function getWorkOrders(){
     return (cell.value !== undefined && cell.value !== null) ? cell.value : (cell.displayValue || '');
   }
 
-  const jobs = (data.rows || []).map(row => ({
-    rowId: row.id,
-    sheetId: row.sheetId,
-    workOrderId: cellValue(cellFor(row, 'Primary')) || '',
-    workOrderType: cellValue(cellFor(row, 'Work Order Type')),
-    zone: cellValue(cellFor(row, 'Project & Zone Number')) || '(no zone)',
-    complete: cellValue(cellFor(row, 'Complete')) || 'Not Started',
-    startDate: cellValue(cellFor(row, 'Scheduled Start Date')) || null,
-    endDate: cellValue(cellFor(row, 'Scheduled End Date')) || null
-  })).filter(j => (j.workOrderType || '').toUpperCase() === CONFIG.JOB_TYPE_FILTER
+  const jobs = (data.rows || []).map(row => {
+    const profile = cellValue(cellFor(row, 'F_Profile'));
+    const gaugeMatch = profile.match(/^(\d+)/);
+    return {
+      rowId: row.id,
+      sheetId: row.sheetId,
+      workOrderId: cellValue(cellFor(row, 'Primary')) || '',
+      workOrderType: cellValue(cellFor(row, 'Work Order Type')),
+      zone: cellValue(cellFor(row, 'Project & Zone Number')) || '(no zone)',
+      complete: cellValue(cellFor(row, 'Complete')) || 'Not Started',
+      startDate: cellValue(cellFor(row, 'Scheduled Start Date')) || null,
+      endDate: cellValue(cellFor(row, 'Scheduled End Date')) || null,
+      workRecordUrl: cellValue(cellFor(row, 'Work Record URL')) || null,
+      gauge: gaugeMatch ? gaugeMatch[1] : null
+    };
+  }).filter(j => (j.workOrderType || '').toUpperCase() === CONFIG.JOB_TYPE_FILTER
                && j.complete !== 'Complete');
 
   jobs.sort((a,b) => (a.startDate||'').localeCompare(b.startDate||''));
@@ -672,10 +785,14 @@ async function getPageRows(page){
 }
 
 // Parses the "Plan Material Summary" detailer report: header info + frame table.
+// The trailing group captures anything after Total Weight (e.g. CHK DRAWING /
+// WELD / CHK WELD columns on report layouts that include them) without
+// requiring a fixed shape, so a report with extra columns doesn't just fail
+// to match at all — whatever's there gets carried through as extraColumns.
 async function extractDetailerReport(pdfDoc){
   let header = { client:'', jobNumber:'', title:'', sectionTitle:'', frameCount:null };
   const frames = [];
-  const rowRe = /^([A-Za-z0-9\-]+)\s+([\d.]+)\s*m\s+([\d.]+)\s*m\s+([\d.]+)\s*m\s+(\d+)\s+([\d.]+)\s*kg\s+([\d.]+)\s*kg\s+([\d.]+)\s*kg$/;
+  const rowRe = /^([A-Za-z0-9\-]+)\s+([\d.]+)\s*m\s+([\d.]+)\s*m\s+([\d.]+)\s*m\s+(\d+)\s+([\d.]+)\s*kg\s+([\d.]+)\s*kg\s+([\d.]+)\s*kg(?:\s+(.+))?$/;
 
   for(let p = 1; p <= pdfDoc.numPages; p++){
     const page = await pdfDoc.getPage(p);
@@ -708,6 +825,7 @@ async function extractDetailerReport(pdfDoc){
           plateWeight: rowMatch[6] + ' kg',
           studWeight: rowMatch[7] + ' kg',
           totalWeight: rowMatch[8] + ' kg',
+          extraColumns: rowMatch[9] ? rowMatch[9].trim() : '',
           page: p,
           y: r.y,
           x: r.items[0].x
@@ -848,6 +966,8 @@ const AppState = {
   header: null,
   doneSet: new Set(),
   searchTerm: '',
+  sessionStartTime: null,      // ISO string, null when no session is active
+  sessionStartDoneSet: new Set(), // snapshot of doneSet at Start Job time
   candidateAttachments: []
 };
 
@@ -885,6 +1005,7 @@ document.querySelectorAll('#tabbar button').forEach(btn => {
 document.getElementById('btnBack').addEventListener('click', () => {
   document.getElementById('btnBack').style.visibility = 'hidden';
   document.getElementById('jobHeader').textContent = '';
+  document.getElementById('btnWorkRecord').style.display = 'none';
   showScreen('screen-jobs');
   setTabbarVisible(false);
 });
@@ -923,6 +1044,11 @@ async function loadJobs(){
   try{
     AppState.jobs = await getWorkOrders();
     renderJobList();
+    // Session counts render after the main list — no need to hold up the
+    // list itself waiting on a second sheet fetch.
+    const counts = await getSessionCounts();
+    AppState.jobs.forEach(j => { j.sessionCount = counts[j.workOrderId] || 0; });
+    renderJobList();
   }catch(e){
     container.innerHTML = '<div class="empty">Couldn\'t load jobs.<br>' + escapeHtml(e.message) + '</div>';
   }
@@ -937,20 +1063,31 @@ function renderJobList(){
   container.innerHTML = '';
   AppState.jobs.forEach(job => {
     const badgeClass = job.complete === 'Partially Complete' ? 'partial' : 'not-started';
+    const sessionCount = job.sessionCount || 0;
     const div = document.createElement('div');
     div.className = 'job-card';
     div.innerHTML =
       '<div class="card-top">' +
         '<span class="wo-id">' + escapeHtml(job.workOrderId || '\u2014') + '</span>' +
+        (job.workRecordUrl ? '<button class="link-btn" data-url="' + escapeHtml(job.workRecordUrl) + '">Work Record &#8599;</button>' : '') +
         '<span class="badge ' + badgeClass + '">' + escapeHtml(job.complete || 'Not Started') + '</span>' +
       '</div>' +
       '<div class="card-body">' +
         '<div class="zone">' + escapeHtml(job.zone) + '</div>' +
         '<div class="meta">' +
+          (job.gauge ? '<span class="gauge-chip">' + escapeHtml(job.gauge) + '</span>' : '') +
           (job.startDate ? '<span><b>Start</b> ' + escapeHtml(job.startDate) + '</span>' : '') +
           (job.endDate ? '<span><b>End</b> ' + escapeHtml(job.endDate) + '</span>' : '') +
+          (sessionCount ? '<span>' + sessionCount + ' session' + (sessionCount === 1 ? '' : 's') + '</span>' : '') +
         '</div>' +
       '</div>';
+    const linkBtn = div.querySelector('.link-btn');
+    if(linkBtn){
+      linkBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        window.open(linkBtn.dataset.url, '_blank');
+      });
+    }
     div.addEventListener('click', () => openJob(job));
     container.appendChild(div);
   });
@@ -964,6 +1101,13 @@ async function openJob(job){
   document.getElementById('jobHeader').textContent =
     (job.workOrderId ? job.workOrderId + ' \u2014 ' : '') + job.zone;
   document.getElementById('btnBack').style.visibility = 'visible';
+  const workRecordBtn = document.getElementById('btnWorkRecord');
+  if(job.workRecordUrl){
+    workRecordBtn.style.display = 'block';
+    workRecordBtn.onclick = () => window.open(job.workRecordUrl, '_blank');
+  } else {
+    workRecordBtn.style.display = 'none';
+  }
   showScreen('screen-report');
   document.getElementById('frameList').innerHTML = '<div class="spinner"></div>';
 
@@ -1050,6 +1194,18 @@ async function loadJobFiles(detailerAtt, drawingsAtt){
   const savedNames = new Set(saved && saved.done ? saved.done : []);
   AppState.doneSet = new Set(frames.map(f=>f.name).filter(n => savedNames.has(n)));
 
+  // Restore an in-progress (not yet saved) session if one was left running —
+  // e.g. the tablet was closed or navigated away before Save Progress.
+  const activeSession = Store.getSessionStart(AppState.currentJob.rowId);
+  if(activeSession){
+    AppState.sessionStartTime = activeSession.startTime;
+    AppState.sessionStartDoneSet = new Set(activeSession.doneAtStart || []);
+  } else {
+    AppState.sessionStartTime = null;
+    AppState.sessionStartDoneSet = new Set();
+  }
+  updateSessionBar();
+
   renderFrameList();
 
   AppState.drawingsPdf = await loadPdf(drawingsBytes.slice(0));
@@ -1098,6 +1254,7 @@ function renderFrameList(){
         '<div class="name">' + escapeHtml(f.name) + '</div>' +
         '<div class="specs">' + escapeHtml(f.totalLength) + ' &middot; ' +
           escapeHtml(f.fasteners) + ' fasteners &middot; ' + escapeHtml(f.totalWeight) +
+          (f.extraColumns ? '<br><span class="extra-cols">' + escapeHtml(f.extraColumns) + '</span>' : '') +
         '</div>' +
       '</div>';
     row.addEventListener('click', () => {
@@ -1131,6 +1288,42 @@ function persistProgress(){
 }
 
 /* =========================================================================
+   START JOB — records a local session start time; the session only becomes
+   a permanent record once Save Progress is hit (see the handler below).
+   ========================================================================= */
+function parseMetres(lengthStr){
+  const m = (lengthStr || '').match(/[\d.]+/);
+  return m ? parseFloat(m[0]) : 0;
+}
+
+function updateSessionBar(){
+  const startBtn = document.getElementById('btnStartJob');
+  const status = document.getElementById('sessionStatus');
+  if(AppState.sessionStartTime){
+    startBtn.style.display = 'none';
+    status.style.display = 'block';
+    const d = new Date(AppState.sessionStartTime);
+    document.getElementById('sessionStartedAt').textContent =
+      'at ' + d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+  } else {
+    startBtn.style.display = 'block';
+    status.style.display = 'none';
+  }
+}
+
+document.getElementById('btnStartJob').addEventListener('click', () => {
+  if(!AppState.currentJob) return;
+  AppState.sessionStartTime = new Date().toISOString();
+  AppState.sessionStartDoneSet = new Set(AppState.doneSet);
+  Store.setSessionStart(AppState.currentJob.rowId, {
+    startTime: AppState.sessionStartTime,
+    doneAtStart: Array.from(AppState.sessionStartDoneSet)
+  });
+  updateSessionBar();
+  toast('Job started', 'ok');
+});
+
+/* =========================================================================
    SAVE PROGRESS — annotate, then upload as a new version of the same
    "IN PROGRESS" attachment (never a fresh duplicate each time).
    ========================================================================= */
@@ -1155,7 +1348,41 @@ document.getElementById('btnSaveProgress').addEventListener('click', async () =>
       await uploadAttachmentBytes(AppState.currentJob.sheetId,
         { rowId: AppState.currentJob.rowId, filename, mode: 'new' }, annotated);
     }
-    toast('Uploaded "' + filename + '" to Smartsheet', 'ok');
+
+    let msg = 'Uploaded "' + filename + '" to Smartsheet';
+
+    // A session only counts once it's saved — Start Job alone logs nothing.
+    if(AppState.sessionStartTime){
+      const sessionFrames = AppState.frames.filter(f =>
+        AppState.doneSet.has(f.name) && !AppState.sessionStartDoneSet.has(f.name));
+      const sessionMetres = sessionFrames.reduce((sum, f) => sum + parseMetres(f.totalLength), 0);
+      const allDoneFrames = AppState.frames.filter(f => AppState.doneSet.has(f.name));
+      const totalMetres = allDoneFrames.reduce((sum, f) => sum + parseMetres(f.totalLength), 0);
+
+      try{
+        await addSessionLogRow({
+          work_order_id: AppState.currentJob.workOrderId,
+          zone: AppState.currentJob.zone,
+          session_start: AppState.sessionStartTime,
+          saved_at: new Date().toISOString(),
+          frames_completed_this_session: sessionFrames.map(f => f.name),
+          frames_completed_count: sessionFrames.length,
+          linear_metres_this_session: Math.round(sessionMetres * 100) / 100,
+          total_frames_done: AppState.doneSet.size,
+          total_linear_metres_done: Math.round(totalMetres * 100) / 100
+        });
+        Store.clearSessionStart(AppState.currentJob.rowId);
+        AppState.sessionStartTime = null;
+        AppState.sessionStartDoneSet = new Set();
+        updateSessionBar();
+        AppState.currentJob.sessionCount = (AppState.currentJob.sessionCount || 0) + 1;
+        msg += ' — session logged';
+      }catch(e){
+        msg = 'Uploaded to Smartsheet, but session log failed: ' + e.message;
+      }
+    }
+
+    toast(msg, 'ok');
   }catch(e){
     toast('Save failed: ' + e.message, 'err');
   }finally{
