@@ -192,14 +192,33 @@
   .badge.partial{background:var(--orange);color:#fff;}
 
   /* ---------- Report tab ---------- */
+  #reportHeader{
+    position:sticky;top:0;z-index:5;
+  }
   #reportSummary{
     display:flex;justify-content:space-between;align-items:center;
     padding:10px 14px;background:var(--card);
-    position:sticky;top:0;z-index:5;
     border-bottom:1px solid var(--line);
   }
   #reportSummary .count{font-size:14px;font-weight:700;}
   #reportSummary .count .n{color:var(--orange);}
+  #searchBar{
+    display:flex;align-items:center;gap:8px;
+    padding:10px 14px;background:var(--card);
+    border-bottom:1px solid var(--line);
+  }
+  #searchInput{
+    flex:1;min-height:46px;
+    border:2px solid var(--line);border-radius:11px;
+    padding:0 14px;font-size:16px;
+    background:var(--bg);color:var(--text);
+  }
+  #searchInput:focus{border-color:var(--orange);outline:none;}
+  #btnClearSearch{
+    min-height:46px;padding:0 14px;
+    border:none;border-radius:11px;background:var(--charcoal-2);color:#fff;
+    font-size:14px;font-weight:700;display:none;
+  }
   .frame-row{
     display:flex;align-items:center;gap:14px;
     background:var(--card);
@@ -259,15 +278,21 @@
   }
   #zoomHint.show{opacity:1;}
   .page-grid{
-    display:grid;grid-template-columns:repeat(5,1fr);gap:10px;
-    max-height:60vh;overflow-y:auto;padding:4px 2px;
+    display:grid;grid-template-columns:repeat(3,1fr);gap:10px;
+    max-height:55vh;overflow-y:auto;padding:4px 2px;
   }
   .page-grid button{
-    min-height:56px;border-radius:10px;border:2px solid var(--line);
-    background:#fff;color:var(--text);font-weight:700;font-size:16px;
+    min-height:60px;border-radius:10px;border:2px solid var(--line);
+    background:#fff;color:var(--text);font-weight:700;
+    display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;
+    padding:6px 4px;
   }
+  .page-grid button .dnum{font-size:15px;}
+  .page-grid button .pnum{font-size:11px;font-weight:600;color:var(--muted);}
   .page-grid button.current{background:var(--orange);color:#fff;border-color:var(--orange);}
+  .page-grid button.current .pnum{color:#fff;opacity:.85;}
   .page-grid button:active{background:var(--line);}
+  .no-match{text-align:center;color:var(--muted);padding:30px 10px;font-size:15px;}
 
   /* ---------- Settings ---------- */
   .kv{display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--line);font-size:14px;}
@@ -286,6 +311,13 @@
     max-height:80vh;overflow-y:auto;
     padding:16px;
   }
+  #modalSearchInput{
+    width:100%;min-height:50px;
+    border:2px solid var(--line);border-radius:11px;
+    padding:0 14px;font-size:16px;
+    background:var(--bg);color:var(--text);
+  }
+  #modalSearchInput:focus{border-color:var(--orange);outline:none;}
   .pick-row{
     padding:16px;border-bottom:1px solid var(--line);
     font-size:15px;
@@ -346,9 +378,15 @@
 
     <!-- ===================== REPORT TAB ===================== -->
     <div class="screen" id="screen-report">
-      <div id="reportSummary">
-        <div class="count"><span class="n" id="doneCount">0</span> / <span id="totalCount">0</span> frames done</div>
-        <button class="btn" style="width:auto;min-height:40px;padding:0 16px;font-size:13px;" id="btnSaveProgress">Save Progress</button>
+      <div id="reportHeader">
+        <div id="reportSummary">
+          <div class="count"><span class="n" id="doneCount">0</span> / <span id="totalCount">0</span> frames done</div>
+          <button class="btn" style="width:auto;min-height:40px;padding:0 16px;font-size:13px;" id="btnSaveProgress">Save Progress</button>
+        </div>
+        <div id="searchBar">
+          <input type="text" id="searchInput" placeholder="Search frame name..." autocomplete="off">
+          <button id="btnClearSearch">Clear</button>
+        </div>
       </div>
       <div id="frameList"></div>
     </div>
@@ -414,6 +452,7 @@
 <div id="modalOverlay">
   <div id="modalSheet">
     <h2 id="modalTitle">Pick a file</h2>
+    <input type="text" id="modalSearchInput" placeholder="Search drawing number..." autocomplete="off" style="display:none;margin-bottom:12px;">
     <div id="modalList"></div>
     <button class="btn outline" style="margin-top:10px;" onclick="closeModal()">Cancel</button>
   </div>
@@ -663,6 +702,26 @@ async function extractDetailerReport(pdfDoc){
   return { header, frames };
 }
 
+// Reads the "Drawing Number" printed in each drawing page's title block.
+// On these Austruss title blocks it reliably appears as the token right
+// after the fixed office phone number, regardless of layout variations.
+async function buildDrawingIndex(pdfDoc){
+  const pages = [];
+  const anchorRe = /02\s*4860\s*1416\s+([A-Za-z0-9]{3,15})\b/;
+  for(let p = 1; p <= pdfDoc.numPages; p++){
+    let drawingNumber = null;
+    try{
+      const page = await pdfDoc.getPage(p);
+      const content = await page.getTextContent();
+      const text = content.items.map(i => i.str).join(' ');
+      const m = text.match(anchorRe);
+      if(m) drawingNumber = m[1].toUpperCase();
+    }catch(e){ /* leave this page unindexed rather than fail the whole scan */ }
+    pages.push({ page: p, drawingNumber });
+  }
+  return pages;
+}
+
 /* =========================================================================
    PDF ANNOTATION (pdf-lib) — marks completed frame rows on a copy of the
    original detailer report before it's uploaded back to Smartsheet.
@@ -700,9 +759,12 @@ const AppState = {
   drawingsPdf: null,
   drawingsPage: 1,
   drawingsPageCount: 0,
+  drawingPages: [],
+  drawingIndexPromise: null,
   frames: [],
   header: null,
   doneSet: new Set(),
+  searchTerm: '',
   candidateAttachments: []
 };
 
@@ -865,6 +927,7 @@ function pickAttachmentsManually(list, guessedDetailer, guessedDrawings){
 
 function openModal(title, list, cb, highlighted){
   document.getElementById('modalTitle').textContent = title;
+  document.getElementById('modalSearchInput').style.display = 'none';
   const listEl = document.getElementById('modalList');
   listEl.className = '';
   listEl.innerHTML = '';
@@ -885,6 +948,9 @@ function closeModal(){
 
 async function loadJobFiles(detailerAtt, drawingsAtt){
   document.getElementById('frameList').innerHTML = '<div class="spinner"></div>';
+  AppState.searchTerm = '';
+  document.getElementById('searchInput').value = '';
+  document.getElementById('btnClearSearch').style.display = 'none';
   const [detailerBytes, drawingsBytes] = await Promise.all([
     downloadAttachmentBytes(AppState.currentJob.sheetId, detailerAtt.id),
     downloadAttachmentBytes(AppState.currentJob.sheetId, drawingsAtt.id)
@@ -906,6 +972,11 @@ async function loadJobFiles(detailerAtt, drawingsAtt){
   AppState.drawingsPdf = await loadPdf(drawingsBytes.slice(0));
   AppState.drawingsPageCount = AppState.drawingsPdf.numPages;
   AppState.drawingsPage = 1;
+  AppState.drawingPages = [];
+  // Runs in the background — the report tab is usable immediately, and the
+  // jump/search modal just awaits this promise if it isn't done yet.
+  AppState.drawingIndexPromise = buildDrawingIndex(AppState.drawingsPdf)
+    .then(pages => { AppState.drawingPages = pages; });
 
   setTabbarVisible(true);
   setActiveTab('report');
@@ -918,7 +989,16 @@ async function loadJobFiles(detailerAtt, drawingsAtt){
 function renderFrameList(){
   const list = document.getElementById('frameList');
   list.innerHTML = '';
-  AppState.frames.forEach(f => {
+  const term = (AppState.searchTerm || '').trim().toLowerCase();
+  const visible = term
+    ? AppState.frames.filter(f => f.name.toLowerCase().includes(term))
+    : AppState.frames;
+
+  if(!visible.length){
+    list.innerHTML = '<div class="empty">No frames match &ldquo;' + escapeHtml(AppState.searchTerm) + '&rdquo;</div>';
+  }
+
+  visible.forEach(f => {
     const done = AppState.doneSet.has(f.name);
     const row = document.createElement('div');
     row.className = 'frame-row' + (done ? ' done' : '');
@@ -938,9 +1018,22 @@ function renderFrameList(){
     });
     list.appendChild(row);
   });
+  // Counts always reflect all frames, not just the filtered/visible ones.
   document.getElementById('doneCount').textContent = AppState.doneSet.size;
   document.getElementById('totalCount').textContent = AppState.frames.length;
 }
+
+document.getElementById('searchInput').addEventListener('input', (e) => {
+  AppState.searchTerm = e.target.value;
+  document.getElementById('btnClearSearch').style.display = AppState.searchTerm ? 'block' : 'none';
+  renderFrameList();
+});
+document.getElementById('btnClearSearch').addEventListener('click', () => {
+  AppState.searchTerm = '';
+  document.getElementById('searchInput').value = '';
+  document.getElementById('btnClearSearch').style.display = 'none';
+  renderFrameList();
+});
 
 function persistProgress(){
   if(!AppState.currentJob) return;
@@ -1049,19 +1142,53 @@ function flashZoomHint(){
 document.getElementById('btnPagePrev').addEventListener('click', () => goToDrawingPage(AppState.drawingsPage - 1));
 document.getElementById('btnPageNext').addEventListener('click', () => goToDrawingPage(AppState.drawingsPage + 1));
 
-document.getElementById('btnPageJump').addEventListener('click', () => {
+document.getElementById('btnPageJump').addEventListener('click', async () => {
+  document.getElementById('modalTitle').textContent = 'Jump to page or drawing';
+  const searchEl = document.getElementById('modalSearchInput');
+  const listEl = document.getElementById('modalList');
+  searchEl.style.display = 'block';
+  searchEl.value = '';
+  listEl.className = 'page-grid';
+  listEl.innerHTML = '<div class="spinner"></div>';
+  document.getElementById('modalOverlay').classList.add('show');
+
+  if(AppState.drawingIndexPromise) await AppState.drawingIndexPromise;
+  renderPageGrid('');
+  searchEl.focus();
+});
+
+function renderPageGrid(term){
   const listEl = document.getElementById('modalList');
   listEl.className = 'page-grid';
   listEl.innerHTML = '';
-  for(let i = 1; i <= AppState.drawingsPageCount; i++){
-    const btn = document.createElement('button');
-    btn.textContent = i;
-    if(i === AppState.drawingsPage) btn.classList.add('current');
-    btn.addEventListener('click', () => { closeModal(); goToDrawingPage(i); });
-    listEl.appendChild(btn);
+  term = term.trim().toUpperCase();
+
+  const pages = AppState.drawingPages.length
+    ? AppState.drawingPages
+    : Array.from({length: AppState.drawingsPageCount}, (_, i) => ({page: i+1, drawingNumber: null}));
+
+  const matches = term
+    ? pages.filter(p => (p.drawingNumber && p.drawingNumber.includes(term)) || String(p.page) === term)
+    : pages;
+
+  if(!matches.length){
+    listEl.innerHTML = '<div class="no-match">No drawing matches &ldquo;' + escapeHtml(term) + '&rdquo;</div>';
+    return;
   }
-  document.getElementById('modalTitle').textContent = 'Jump to page';
-  document.getElementById('modalOverlay').classList.add('show');
+
+  matches.forEach(p => {
+    const btn = document.createElement('button');
+    if(p.page === AppState.drawingsPage) btn.classList.add('current');
+    btn.innerHTML =
+      '<span class="dnum">' + escapeHtml(p.drawingNumber || ('Pg ' + p.page)) + '</span>' +
+      (p.drawingNumber ? '<span class="pnum">Page ' + p.page + '</span>' : '');
+    btn.addEventListener('click', () => { closeModal(); goToDrawingPage(p.page); });
+    listEl.appendChild(btn);
+  });
+}
+
+document.getElementById('modalSearchInput').addEventListener('input', (e) => {
+  renderPageGrid(e.target.value);
 });
 
 // Pinch-zoom + pan when zoomed in; swipe left/right to change pages when at
