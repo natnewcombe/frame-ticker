@@ -210,15 +210,22 @@
   #sessionBar{
     padding:10px 14px;background:var(--charcoal);
     border-bottom:1px solid #000;
+    display:flex;align-items:center;gap:10px;
   }
   #btnStartJob{
-    width:100%;min-height:48px;border:none;border-radius:11px;
+    flex:1;min-height:48px;border:none;border-radius:11px;
     background:var(--orange);color:#fff;font-size:15px;font-weight:800;
   }
   #btnStartJob:active{background:var(--orange-dark);}
   #sessionStatus{
-    color:#C9E9CE;font-size:13.5px;font-weight:700;text-align:center;
+    flex:1;color:#C9E9CE;font-size:13.5px;font-weight:700;text-align:center;
   }
+  #btnViewSessions{
+    min-height:48px;padding:0 16px;border:2px solid rgba(255,255,255,.25);
+    border-radius:11px;background:transparent;color:#fff;font-size:14px;font-weight:700;
+    flex-shrink:0;
+  }
+  #btnViewSessions:active{background:rgba(255,255,255,.12);}
   #reportSummary{
     display:flex;justify-content:space-between;align-items:center;
     padding:10px 14px;background:var(--card);
@@ -340,6 +347,25 @@
   .page-grid button:active{background:var(--line);}
   .no-match{text-align:center;color:var(--muted);padding:30px 10px;font-size:15px;}
 
+  .session-list{display:flex;flex-direction:column;gap:10px;max-height:60vh;overflow-y:auto;}
+  .session-card{
+    border:1px solid var(--line);border-radius:12px;padding:14px;background:var(--bg);
+  }
+  .session-card .srow{
+    display:flex;justify-content:space-between;align-items:baseline;
+    font-size:13px;color:var(--muted);margin-bottom:6px;
+  }
+  .session-card .srow b{color:var(--text);font-size:14px;}
+  .session-card .sstats{
+    display:flex;gap:16px;margin:8px 0;font-size:14px;
+  }
+  .session-card .sstats .n{font-weight:800;color:var(--orange);}
+  .session-card .sframes{
+    font-size:12.5px;color:var(--muted);
+    max-height:60px;overflow-y:auto;line-height:1.5;
+    background:#fff;border-radius:8px;padding:6px 10px;margin-top:4px;
+  }
+
   /* ---------- Settings ---------- */
   .kv{display:flex;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--line);font-size:14px;}
   .kv:last-child{border-bottom:none;}
@@ -429,6 +455,7 @@
         <div id="sessionBar">
           <button id="btnStartJob">Start Job</button>
           <div id="sessionStatus" style="display:none;">Session started <span id="sessionStartedAt"></span></div>
+          <button id="btnViewSessions">Sessions</button>
         </div>
         <div id="reportSummary">
           <div class="count"><span class="n" id="doneCount">0</span> / <span id="totalCount">0</span> frames done</div>
@@ -658,6 +685,18 @@ async function getSessionCounts(){
   }
 }
 
+// Fetches every logged session for one job, newest first.
+async function getSessionsForJob(workOrderId){
+  const url = SUPABASE_URL + '/rest/v1/session_log?work_order_id=eq.' +
+    encodeURIComponent(workOrderId) + '&order=saved_at.desc';
+  const res = await fetch(url, { headers: supabaseHeaders() });
+  if(!res.ok){
+    const body = await res.text().catch(()=> '');
+    throw new Error('Could not load sessions (' + res.status + '): ' + body.slice(0,200));
+  }
+  return res.json();
+}
+
 // Download attachment bytes — proxy resolves the 60-second pre-signed URL
 // and streams the bytes back in one round trip.
 async function downloadAttachmentBytes(sheetId, attachmentId){
@@ -815,7 +854,7 @@ async function extractDetailerReport(pdfDoc){
         header.frameCount = parseInt(countMatch[1], 10);
       }
       const rowMatch = r.text.match(rowRe);
-      if(rowMatch){
+      if(rowMatch && rowMatch[1].toUpperCase() !== 'TOTALS' && rowMatch[1].toUpperCase() !== 'TOTAL'){
         frames.push({
           name: rowMatch[1],
           plateLength: rowMatch[2] + ' m',
@@ -1322,6 +1361,54 @@ document.getElementById('btnStartJob').addEventListener('click', () => {
   updateSessionBar();
   toast('Job started', 'ok');
 });
+
+document.getElementById('btnViewSessions').addEventListener('click', async () => {
+  if(!AppState.currentJob) return;
+  document.getElementById('modalTitle').textContent = 'Sessions \u2014 ' + (AppState.currentJob.workOrderId || AppState.currentJob.zone);
+  document.getElementById('modalSearchInput').style.display = 'none';
+  const listEl = document.getElementById('modalList');
+  listEl.className = 'session-list';
+  listEl.innerHTML = '<div class="spinner"></div>';
+  document.getElementById('modalOverlay').classList.add('show');
+
+  try{
+    const sessions = await getSessionsForJob(AppState.currentJob.workOrderId);
+    renderSessionList(sessions);
+  }catch(e){
+    listEl.innerHTML = '<div class="empty">Couldn\'t load sessions.<br>' + escapeHtml(e.message) + '</div>';
+  }
+});
+
+function formatDateTime(iso){
+  if(!iso) return '\u2014';
+  const d = new Date(iso);
+  return d.toLocaleDateString([], {day:'2-digit', month:'short'}) + ' ' +
+    d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'});
+}
+
+function renderSessionList(sessions){
+  const listEl = document.getElementById('modalList');
+  if(!sessions.length){
+    listEl.innerHTML = '<div class="empty">No sessions logged for this job yet.</div>';
+    return;
+  }
+  listEl.innerHTML = sessions.map(s => {
+    const frameNames = (s.frames_completed_this_session || []).join(', ');
+    return '<div class="session-card">' +
+      '<div class="srow"><span>Started</span><b>' + escapeHtml(formatDateTime(s.session_start)) + '</b></div>' +
+      '<div class="srow"><span>Saved</span><b>' + escapeHtml(formatDateTime(s.saved_at)) + '</b></div>' +
+      '<div class="sstats">' +
+        '<span><span class="n">' + (s.frames_completed_count ?? 0) + '</span> frames</span>' +
+        '<span><span class="n">' + (s.linear_metres_this_session ?? 0) + 'm</span> this session</span>' +
+      '</div>' +
+      (frameNames ? '<div class="sframes">' + escapeHtml(frameNames) + '</div>' : '') +
+      '<div class="srow" style="margin-top:8px;margin-bottom:0;">' +
+        '<span>Job total at this save</span>' +
+        '<b>' + (s.total_frames_done ?? 0) + ' frames &middot; ' + (s.total_linear_metres_done ?? 0) + 'm</b>' +
+      '</div>' +
+    '</div>';
+  }).join('');
+}
 
 /* =========================================================================
    SAVE PROGRESS — annotate, then upload as a new version of the same
