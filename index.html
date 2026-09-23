@@ -276,6 +276,31 @@
   .frame-row .name{font-size:17px;font-weight:700;}
   .frame-row.done .name{color:var(--muted);text-decoration:line-through;}
   .frame-row .specs{font-size:12.5px;color:var(--muted);margin-top:2px;}
+  .row-actions{display:flex;flex-direction:column;gap:6px;flex-shrink:0;}
+  .row-action-btn{
+    position:relative;
+    width:40px;height:40px;border-radius:10px;border:1px solid var(--line);
+    background:#fff;font-size:17px;
+    display:flex;align-items:center;justify-content:center;
+  }
+  .row-action-btn:active{background:var(--bg);}
+  .row-action-btn.has-issue{background:#FCE4E1;border-color:var(--bad);}
+  .issue-count{
+    position:absolute;top:-6px;right:-6px;
+    background:var(--bad);color:#fff;font-size:10px;font-weight:800;
+    min-width:16px;height:16px;border-radius:8px;
+    display:flex;align-items:center;justify-content:center;padding:0 3px;
+  }
+  .issue-existing{max-height:160px;overflow-y:auto;margin-bottom:10px;}
+  .issue-item{padding:10px 0;border-bottom:1px solid var(--line);}
+  .issue-item .issue-time{font-size:11.5px;color:var(--muted);font-weight:700;}
+  .issue-item .issue-note{font-size:14px;color:var(--text);margin-top:2px;}
+  #issueNoteInput{
+    width:100%;min-height:80px;border:2px solid var(--line);border-radius:11px;
+    padding:10px 12px;font-size:15px;font-family:inherit;resize:vertical;
+    background:var(--bg);color:var(--text);
+  }
+  #issueNoteInput:focus{border-color:var(--orange);outline:none;}
   .extra-cols{color:var(--charcoal-2);font-weight:600;}
 
   /* ---------- Drawings tab ---------- */
@@ -708,6 +733,33 @@ async function getSessionsForJob(workOrderId){
   return res.json();
 }
 
+// Fetches every open issue note for a job, grouped by frame name.
+async function getIssuesForJob(workOrderId){
+  const url = SUPABASE_URL + '/rest/v1/frame_issues?work_order_id=eq.' +
+    encodeURIComponent(workOrderId) + '&order=created_at.desc';
+  const res = await fetch(url, { headers: supabaseHeaders() });
+  if(!res.ok) return {};
+  const rows = await res.json();
+  const byFrame = {};
+  rows.forEach(r => {
+    if(!byFrame[r.frame_name]) byFrame[r.frame_name] = [];
+    byFrame[r.frame_name].push(r);
+  });
+  return byFrame;
+}
+
+async function addFrameIssue(fields){
+  const res = await fetch(SUPABASE_URL + '/rest/v1/frame_issues', {
+    method: 'POST',
+    headers: supabaseHeaders({ 'Content-Type': 'application/json', 'Prefer': 'return=minimal' }),
+    body: JSON.stringify(fields)
+  });
+  if(!res.ok){
+    const body = await res.text().catch(()=> '');
+    throw new Error('Could not save issue (' + res.status + '): ' + body.slice(0,200));
+  }
+}
+
 // Download attachment bytes — proxy resolves the 60-second pre-signed URL
 // and streams the bytes back in one round trip.
 async function downloadAttachmentBytes(sheetId, attachmentId){
@@ -765,6 +817,13 @@ async function getWorkOrders(){
     if(!cell) return '';
     return (cell.value !== undefined && cell.value !== null) ? cell.value : (cell.displayValue || '');
   }
+  // Contact-list columns (like Designer) hold the email in `value` and the
+  // person's name in `displayValue` — for a human-readable @mention, the
+  // name is what we want, not the email.
+  function cellDisplayValue(cell){
+    if(!cell) return '';
+    return cell.displayValue || cell.value || '';
+  }
 
   const jobs = (data.rows || []).map(row => {
     const profile = cellValue(cellFor(row, 'F_Profile'));
@@ -779,12 +838,14 @@ async function getWorkOrders(){
       startDate: cellValue(cellFor(row, 'Scheduled Start Date')) || null,
       endDate: cellValue(cellFor(row, 'Scheduled End Date')) || null,
       workRecordUrl: cellValue(cellFor(row, 'Work Record URL')) || null,
-      gauge: gaugeMatch ? gaugeMatch[1] : null
+      gauge: gaugeMatch ? gaugeMatch[1] : null,
+      designer: cellDisplayValue(cellFor(row, 'Designer')) || null
     };
   }).filter(j => (j.workOrderType || '').toUpperCase() === CONFIG.JOB_TYPE_FILTER
                && j.complete !== 'Complete');
 
-  jobs.sort((a,b) => (a.startDate||'').localeCompare(b.startDate||''));
+  // No client-side re-sort — this keeps whatever row order the report
+  // itself is configured with in Smartsheet.
   return jobs;
 }
 
@@ -1035,6 +1096,7 @@ const AppState = {
   searchTerm: '',
   sessionStartTime: null,      // ISO string, null when no session is active
   sessionStartDoneSet: new Set(), // snapshot of doneSet at Start Job time
+  issuesByFrame: {}, // frame name -> array of {note, created_at}
   candidateAttachments: []
 };
 
@@ -1273,6 +1335,14 @@ async function loadJobFiles(detailerAtt, drawingsAtt){
   }
   updateSessionBar();
 
+  // Issue notes load in the background — the checklist itself is usable
+  // immediately, flags just appear a moment later once fetched.
+  AppState.issuesByFrame = {};
+  getIssuesForJob(AppState.currentJob.workOrderId).then(byFrame => {
+    AppState.issuesByFrame = byFrame;
+    if(document.getElementById('screen-report').classList.contains('active')) renderFrameList();
+  });
+
   renderFrameList();
 
   AppState.drawingsPdf = await loadPdf(drawingsBytes.slice(0));
@@ -1316,6 +1386,7 @@ function renderFrameList(){
 
   visible.forEach(f => {
     const done = AppState.doneSet.has(f.name);
+    const issues = AppState.issuesByFrame[f.name] || [];
     const row = document.createElement('div');
     row.className = 'frame-row' + (done ? ' done' : '');
     const tagChips = (f.tags && f.tags.length)
@@ -1330,8 +1401,25 @@ function renderFrameList(){
           escapeHtml(f.fasteners) + ' fasteners &middot; ' + escapeHtml(f.totalWeight) +
           (f.extraColumns ? '<br><span class="extra-cols">' + escapeHtml(f.extraColumns) + '</span>' : '') +
         '</div>' +
+      '</div>' +
+      '<div class="row-actions">' +
+        '<button class="row-action-btn btn-view-drawing" title="View drawing">&#128196;</button>' +
+        '<button class="row-action-btn btn-note-issue' + (issues.length ? ' has-issue' : '') + '" title="Note an issue">&#9873;' +
+          (issues.length ? '<span class="issue-count">' + issues.length + '</span>' : '') +
+        '</button>' +
       '</div>';
+
+    row.querySelector('.btn-view-drawing').addEventListener('click', (e) => {
+      e.stopPropagation();
+      jumpToFrameDrawing(f);
+    });
+    row.querySelector('.btn-note-issue').addEventListener('click', (e) => {
+      e.stopPropagation();
+      openIssueModal(f);
+    });
+
     row.addEventListener('click', () => {
+      if(navigator.vibrate) navigator.vibrate(10);
       if(AppState.doneSet.has(f.name)) AppState.doneSet.delete(f.name);
       else AppState.doneSet.add(f.name);
       persistProgress();
@@ -1359,6 +1447,120 @@ document.getElementById('btnClearSearch').addEventListener('click', () => {
 function persistProgress(){
   if(!AppState.currentJob) return;
   Store.setJobState(AppState.currentJob.rowId, { done: Array.from(AppState.doneSet) });
+}
+
+/* =========================================================================
+   JUMP TO DRAWING — reuses the same drawing-number index built for search.
+   ========================================================================= */
+function jumpToFrameDrawing(f){
+  if(!AppState.drawingsPdf){ toast('Drawings not loaded yet', 'err'); return; }
+  const go = () => {
+    const entry = AppState.drawingPages.find(p => p.drawingNumber === f.name.toUpperCase());
+    if(entry){
+      showScreen('screen-drawings');
+      setActiveTab('drawings');
+      goToDrawingPage(entry.page);
+    } else {
+      toast('No drawing found for ' + f.name, 'err');
+    }
+  };
+  if(AppState.drawingPages.length || !AppState.drawingIndexPromise){
+    go();
+  } else {
+    toast('Finding drawing\u2026');
+    AppState.drawingIndexPromise.then(go);
+  }
+}
+
+/* =========================================================================
+   NOTE AN ISSUE — logged to Supabase, flagged on the frame row afterward.
+   ========================================================================= */
+function buildIssueShareText(f, note, createdAt){
+  const job = AppState.currentJob || {};
+  return '\u26a0\ufe0f Frame Issue \u2014 ' + (job.zone || '') + '\n' +
+    'Work Order: ' + (job.workOrderId || '') + '\n' +
+    'Frame: ' + (f.label || f.name) + '\n' +
+    'Issue: ' + note +
+    (job.designer ? '\n\n@' + job.designer : '');
+}
+
+async function shareIssueText(text){
+  if(navigator.share){
+    try{
+      await navigator.share({ text });
+      return true;
+    }catch(e){
+      if(e.name === 'AbortError') return false; // user cancelled the share sheet
+      // fall through to clipboard on any other failure
+    }
+  }
+  try{
+    await navigator.clipboard.writeText(text);
+    toast('Copied \u2014 paste into Teams', 'ok');
+    return true;
+  }catch(e){
+    toast('Could not share or copy: ' + e.message, 'err');
+    return false;
+  }
+}
+
+function openIssueModal(f){
+  document.getElementById('modalTitle').textContent = 'Issue \u2014 ' + (f.label || f.name);
+  document.getElementById('modalSearchInput').style.display = 'none';
+  const listEl = document.getElementById('modalList');
+  listEl.className = 'issue-modal';
+
+  const existing = AppState.issuesByFrame[f.name] || [];
+  const existingHtml = existing.length
+    ? '<div class="issue-existing">' + existing.map((i, idx) =>
+        '<div class="issue-item">' +
+          '<div class="issue-time">' + escapeHtml(formatDateTime(i.created_at)) + '</div>' +
+          '<div class="issue-note">' + escapeHtml(i.note) + '</div>' +
+          '<button class="btn outline btn-share-issue" data-idx="' + idx + '" style="min-height:36px;margin-top:6px;font-size:13px;">Share to Teams</button>' +
+        '</div>'
+      ).join('') + '</div>'
+    : '<div class="empty" style="padding:16px 0;">No issues noted yet for this frame.</div>';
+
+  listEl.innerHTML = existingHtml +
+    '<textarea id="issueNoteInput" placeholder="Describe the issue..." rows="3"></textarea>' +
+    '<button class="btn" id="btnSubmitIssue" style="margin-top:10px;">Save &amp; Share to Teams</button>';
+
+  document.getElementById('modalOverlay').classList.add('show');
+
+  listEl.querySelectorAll('.btn-share-issue').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const i = existing[parseInt(btn.dataset.idx, 10)];
+      shareIssueText(buildIssueShareText(f, i.note, i.created_at));
+    });
+  });
+
+  document.getElementById('btnSubmitIssue').addEventListener('click', async () => {
+    const noteEl = document.getElementById('issueNoteInput');
+    const note = noteEl.value.trim();
+    if(!note){ toast('Enter a note first', 'err'); return; }
+    const btn = document.getElementById('btnSubmitIssue');
+    btn.disabled = true;
+    btn.textContent = 'Saving\u2026';
+    try{
+      const createdAt = new Date().toISOString();
+      await addFrameIssue({
+        work_order_id: AppState.currentJob.workOrderId,
+        zone: AppState.currentJob.zone,
+        frame_name: f.name,
+        note: note
+      });
+      if(!AppState.issuesByFrame[f.name]) AppState.issuesByFrame[f.name] = [];
+      AppState.issuesByFrame[f.name].unshift({ note, created_at: createdAt });
+      closeModal();
+      renderFrameList();
+      toast('Issue saved', 'ok');
+      shareIssueText(buildIssueShareText(f, note, createdAt));
+    }catch(e){
+      toast('Could not save issue: ' + e.message, 'err');
+      btn.disabled = false;
+      btn.textContent = 'Save & Share to Teams';
+    }
+  });
 }
 
 /* =========================================================================
