@@ -1668,6 +1668,7 @@ document.getElementById('modalSearchInput').addEventListener('input', (e) => {
   let pointers = {};
   let startDist = 0, startScale = 1;
   let startPan = {x:0,y:0};
+  let pinchBase = null; // {left, top} — canvas's un-transformed box position, fixed for a gesture
   let lastTap = 0;
   let swipeStart = null;   // {x,y} at gesture start, only tracked when scale===1
   let hintShown = false;
@@ -1693,6 +1694,12 @@ document.getElementById('modalSearchInput').addEventListener('input', (e) => {
       startDist = Math.hypot(a.x-b.x, a.y-b.y);
       startScale = zoomState.scale;
       startPan = {x:zoomState.panX, y:zoomState.panY};
+      // The canvas's box position ignoring any transform (getBoundingClientRect
+      // already reflects the current pan/scale, so subtracting the current pan
+      // recovers the fixed, untransformed position — this stays constant for
+      // the whole gesture since the viewport itself doesn't move or resize).
+      const rect = canvasEl().getBoundingClientRect();
+      pinchBase = { left: rect.left - startPan.x, top: rect.top - startPan.y };
     } else if(ids.length === 1){
       startPan = {x:zoomState.panX - e.clientX, y:zoomState.panY - e.clientY};
       if(zoomState.scale === 1){
@@ -1707,15 +1714,32 @@ document.getElementById('modalSearchInput').addEventListener('input', (e) => {
     }
   }, {passive:false});
 
+  function canvasEl(){ return document.getElementById('drawingCanvas'); }
+
   vp.addEventListener('pointermove', e => {
     if(!pointers[e.pointerId]) return;
     e.preventDefault();
     pointers[e.pointerId] = {x:e.clientX, y:e.clientY};
     const ids = Object.keys(pointers);
-    if(ids.length === 2){
+    if(ids.length === 2 && pinchBase){
       const [a,b] = ids.map(id=>pointers[id]);
       const dist = Math.hypot(a.x-b.x, a.y-b.y);
-      zoomState.scale = Math.max(1, Math.min(6, startScale * (dist/startDist)));
+      const newScale = Math.max(1, Math.min(6, startScale * (dist/startDist)));
+      const mid = {x:(a.x+b.x)/2, y:(a.y+b.y)/2};
+
+      // Anchor the pinch to whatever point is currently under the fingers'
+      // midpoint, in the canvas's own unscaled coordinate space, using the
+      // CURRENT (pre-update) scale and pan — then solve for the new pan that
+      // keeps that exact point under the same screen position at the new
+      // scale. Recomputed every move (not just once at gesture start) so it
+      // also tracks correctly if both fingers drag while pinching.
+      const localX = (mid.x - pinchBase.left - zoomState.panX) / zoomState.scale;
+      const localY = (mid.y - pinchBase.top - zoomState.panY) / zoomState.scale;
+
+      zoomState.scale = newScale;
+      zoomState.panX = mid.x - pinchBase.left - localX * newScale;
+      zoomState.panY = mid.y - pinchBase.top - localY * newScale;
+
       scheduleApplyZoom();
       if(!hintShown && zoomState.scale > 1.05){ hintShown = true; flashZoomHint(); }
     } else if(ids.length === 1 && zoomState.scale > 1){
@@ -1736,7 +1760,17 @@ document.getElementById('modalSearchInput').addEventListener('input', (e) => {
         }
       }
       swipeStart = null;
+      pinchBase = null;
       delete pointers[e.pointerId];
+      // Lifting one finger out of a pinch (without lifting both) would
+      // otherwise jump on the next move, since single-finger pan expects a
+      // startPan captured at that finger's original touch-down — rebase it
+      // to the current position instead.
+      const remaining = Object.keys(pointers);
+      if(remaining.length === 1){
+        const p = pointers[remaining[0]];
+        startPan = {x: zoomState.panX - p.x, y: zoomState.panY - p.y};
+      }
     });
   });
 })();
