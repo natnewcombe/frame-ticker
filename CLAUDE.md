@@ -108,9 +108,9 @@ Facts from the bay, not visible in the code:
   several identical frames, and the report lists each copy with a `-1`, `-2`
   suffix. Sometimes a single frame carries `-1` anyway. Nested labels like
   `GI100-2 (GI100-1 (WELD))` are the same idea.
-- **Parts of one drawing:** `N504.A` / `N504.B` (26018) and `NB2047-A` /
-  `-B` / `-C` (24477) appear in the report where the drawings have `N504`,
-  `NB2047`. (To be confirmed with the bay for the dash form.)
+- **Split frames:** `N504.A` / `N504.B` (26018) and `NB2047-A` / `-B` / `-C`
+  (24477) are parts of one frame, all built from the one drawing (`N504`,
+  `NB2047`).
 - Pack lists (e.g. `24477-LGS-C1-621 … Pack lists`) will be used later; the
   app ignores them for now.
 
@@ -123,6 +123,12 @@ Uses pdf.js 3.11.174 (loaded from cdnjs) to read the text layer, and pdf-lib
   not viewport coordinates. `getPageRows` groups items by exactly rounded y.
   The structural app learned to cluster rows with a tolerance and to work in
   viewport coordinates; see its `getPageItems` before changing this.
+- **Some reports are drawn sideways.** `90 Gable Frames.pdf` is a portrait
+  report placed on a landscape page: `page.rotate` is 0 (so viewport
+  coordinates wouldn't help) but every text item is turned to run down the
+  page. `getPageRows` detects that from the items' direction and maps them
+  back to the portrait layout, and flags the frames `turned` so
+  `annotateDetailerPdf` draws its band and OK sideways to match.
 - `extractDetailerReport` matches each row against one regex (`rowRe`). The
   frame name may carry `(...)` suffixes (`BE3000 (WELD) (CHECK)`): the full
   text is kept as `label`, the stripped name as `name`, which is what ticks are
@@ -157,10 +163,6 @@ stay hidden.
 Measured by the tests against `samples/`; each is pinned so a fix is a
 deliberate change to the test.
 
-- **Frames missing from the list.** 26018: `N504.A`, `N504.B`, `N508.A`,
-  `N508.B` are skipped because `rowRe` doesn't allow a dot in a name (26 of
-  30). `90 Gable Frames.pdf` gives 0 frames: its text is drawn rotated on a
-  landscape page, so rows come out as columns.
 - **📄 can't find the drawing** for copies (`N101-1` vs drawing `N101`, all 163
   truss frames in Zone 16) and parts (`NB2047-A`, 19 frames in 24477). The
   match in `jumpToFrameDrawing` is exact.
