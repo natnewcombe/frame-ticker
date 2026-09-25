@@ -121,6 +121,12 @@ Uses pdf.js 3.11.174 (loaded from cdnjs) to read the text layer, and pdf-lib
 
 - Coordinates are **raw** `transform[4]/[5]` (PDF space, y increases upward),
   not viewport coordinates. `getPageRows` groups items by exactly rounded y.
+- **Some reports are drawn sideways.** `90 Gable Frames.pdf` is a portrait
+  report placed on a landscape page: `page.rotate` is 0 (so viewport
+  coordinates wouldn't help) but every text item is turned to run down the
+  page. `getPageRows` detects that from the items' direction and maps them
+  back to the portrait layout, and flags the frames `turned` so
+  `annotateDetailerPdf` draws its band and OK sideways to match.
   The structural app learned to cluster rows with a tolerance and to work in
   viewport coordinates; see its `getPageItems` before changing this.
 - `extractDetailerReport` matches each row against one regex (`rowRe`). The
@@ -157,10 +163,6 @@ stay hidden.
 Measured by the tests against `samples/`; each is pinned so a fix is a
 deliberate change to the test.
 
-- **Frames missing from the list.** 26018: `N504.A`, `N504.B`, `N508.A`,
-  `N508.B` are skipped because `rowRe` doesn't allow a dot in a name (26 of
-  30). `90 Gable Frames.pdf` gives 0 frames: its text is drawn rotated on a
-  landscape page, so rows come out as columns.
 - **📄 can't find the drawing** for copies (`N101-1` vs drawing `N101`, all 163
   truss frames in Zone 16) and parts (`NB2047-A`, 19 frames in 24477). The
   match in `jumpToFrameDrawing` is exact.

@@ -879,20 +879,34 @@ async function loadPdf(arrayBuffer){
 }
 
 // Groups text items on a page into visual rows by rounded Y position.
+// Some reports (e.g. "90 Gable Frames.pdf") are an ordinary portrait report
+// placed sideways on a landscape page: page.rotate is 0, but every text item
+// is drawn turned 90 degrees, running down the page. Grouping those by raw Y
+// gives columns instead of rows, so turned text is first mapped back to the
+// portrait layout it was drawn from: portrait (x, y) = raw (height - y, x).
+// `turned` is returned so annotateDetailerPdf can map its marks back.
 async function getPageRows(page){
   const content = await page.getTextContent();
+  const pageHeight = page.view[3];
+  // transform is [a, b, c, d, x, y]; (a, b) is the direction the text runs.
+  // Upright text has b = 0. Text running down the page has a = 0, b < 0.
+  const words = content.items.filter(i => i.str.trim());
+  const runningDown = words.filter(i => i.transform[1] < 0 && Math.abs(i.transform[0]) < 0.001).length;
+  const turned = words.length > 0 && runningDown > words.length / 2;
   const rows = {};
   content.items.forEach(item => {
-    const y = Math.round(item.transform[5]);
-    const x = item.transform[4];
+    const rawX = item.transform[4], rawY = item.transform[5];
+    const y = Math.round(turned ? rawX : rawY);
+    const x = turned ? pageHeight - rawY : rawX;
     const key = y;
     if(!rows[key]) rows[key] = [];
     rows[key].push({x, y, str: item.str});
   });
-  return Object.keys(rows).map(y => {
+  const list = Object.keys(rows).map(y => {
     const items = rows[y].sort((a,b)=>a.x-b.x);
     return { y: parseFloat(y), items, text: items.map(i=>i.str).join(' ').replace(/\s+/g,' ').trim() };
   }).sort((a,b)=> b.y - a.y);
+  return { rows: list, turned };
 }
 
 // Parses the "Plan Material Summary" detailer report: header info + frame table.
@@ -911,14 +925,16 @@ async function getPageRows(page){
 // WELD / CHK WELD columns on report layouts that include them) without
 // requiring a fixed shape, so a report with extra columns doesn't just fail
 // to match at all — whatever's there gets carried through as extraColumns.
+// A dot is allowed in the name: split frames come as N504.A / N504.B (and
+// NB2047-A / -B), all built from the one drawing.
 async function extractDetailerReport(pdfDoc){
   let header = { client:'', jobNumber:'', title:'', sectionTitle:'', frameCount:null };
   const frames = [];
-  const rowRe = /^([A-Za-z0-9\-]+(?:\s+\([^()]+\))*)\s+([\d.]+)\s*m\s+([\d.]+)\s*m\s+([\d.]+)\s*m\s+(\d+)\s+([\d.]+)\s*kg\s+([\d.]+)\s*kg\s+([\d.]+)\s*kg(?:\s+(.+))?$/;
+  const rowRe = /^([A-Za-z0-9.\-]+(?:\s+\([^()]+\))*)\s+([\d.]+)\s*m\s+([\d.]+)\s*m\s+([\d.]+)\s*m\s+(\d+)\s+([\d.]+)\s*kg\s+([\d.]+)\s*kg\s+([\d.]+)\s*kg(?:\s+(.+))?$/;
 
   for(let p = 1; p <= pdfDoc.numPages; p++){
     const page = await pdfDoc.getPage(p);
-    const rows = await getPageRows(page);
+    const { rows, turned } = await getPageRows(page);
 
     rows.forEach(r => {
       if(!header.jobNumber){
@@ -956,7 +972,8 @@ async function extractDetailerReport(pdfDoc){
           extraColumns: rowMatch[9] ? rowMatch[9].trim() : '',
           page: p,
           y: r.y,
-          x: r.items[0].x
+          x: r.items[0].x,
+          turned
         });
       }
     });
@@ -1056,7 +1073,7 @@ async function buildDrawingIndex(pdfDoc){
    original detailer report before it's uploaded back to Smartsheet.
    ========================================================================= */
 async function annotateDetailerPdf(originalBytes, frames, doneSet){
-  const { PDFDocument, rgb } = PDFLib;
+  const { PDFDocument, rgb, degrees } = PDFLib;
   const pdfDoc = await PDFDocument.load(originalBytes);
   const pages = pdfDoc.getPages();
 
@@ -1064,7 +1081,20 @@ async function annotateDetailerPdf(originalBytes, frames, doneSet){
     if(!doneSet.has(f.name)) return;
     const page = pages[f.page - 1];
     if(!page) return;
-    const { width } = page.getSize();
+    const { width, height } = page.getSize();
+    if(f.turned){
+      // Report drawn sideways (see getPageRows): the same band and OK as
+      // below, mapped from portrait (x, y) back to raw (y, height - x), with
+      // the OK turned to run down the page like the report's own text.
+      page.drawRectangle({
+        x: f.y - 3, y: 40, width: 14, height: height - 80,
+        color: rgb(0.83, 0.93, 0.84), opacity: 0.7
+      });
+      page.drawText('OK', {
+        x: f.y - 2, y: height - 18, size: 9, color: rgb(0.15, 0.45, 0.2), rotate: degrees(-90)
+      });
+      return;
+    }
     page.drawRectangle({
       x: 40, y: f.y - 3, width: width - 80, height: 14,
       color: rgb(0.83, 0.93, 0.84), opacity: 0.7
