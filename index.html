@@ -1317,9 +1317,18 @@ async function getAppAccountEmail(){
 /* =========================================================================
    NAVIGATION
    ========================================================================= */
+// Every screen scrolls inside the one #content area. The drawings screen
+// doesn't scroll, so visiting it resets #content to the top; without this,
+// tapping 📄 on a frame far down the list and coming back to the Report tab
+// lost your place. Each screen's scroll position is kept and put back.
+const screenScroll = {};
 function showScreen(id){
+  const content = document.getElementById('content');
+  const current = document.querySelector('.screen.active');
+  if(current && current.id !== id) screenScroll[current.id] = content.scrollTop;
   document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
   document.getElementById(id).classList.add('active');
+  if(!current || current.id !== id) content.scrollTop = screenScroll[id] || 0;
 }
 function setTabbarVisible(v){
   document.getElementById('tabbar').style.display = v ? 'flex' : 'none';
@@ -1513,6 +1522,7 @@ async function openJob(job){
   } else {
     workRecordBtn.style.display = 'none';
   }
+  delete screenScroll['screen-report'];   // a new job starts at the top of its list
   showScreen('screen-report');
   document.getElementById('frameList').innerHTML = '<div class="spinner"></div>';
 
