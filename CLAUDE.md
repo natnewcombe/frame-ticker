@@ -63,10 +63,17 @@ look there first for the fix.
 
 ## Smartsheet specifics
 
-- Report: `FRAMECAD - Work Orders Schedule`, ID `7888733526249348`, over the
-  Work Order sheet `8417646009601924`. Jobs render in the report's own row
-  order. The client keeps rows whose Work Order Type is `FRAMECAD` and hides
-  rows marked Complete.
+- The job list has three buttons (`JOB_LISTS`), all over the Work Order sheet
+  `8417646009601924`, jobs in the report's own row order, only rows whose
+  Work Order Type is `FRAMECAD`:
+  - **Scheduled** (default): `FRAMECAD - Work Orders Schedule`, ID
+    `7888733526249348` (`CONFIG.REPORT_ID`), minus rows marked Complete.
+  - **Not completed** / **Completed**: `FRAMECAD - Work Orders`, ID
+    `672067532836740` (`CONFIG.ALL_REPORT_ID`), every work order (892 rows in
+    Sept 2026), split on Complete. Fetched once for both buttons.
+  Reports come a page at a time; `getReportData` keeps fetching until
+  `totalRowCount`. Job search matches work order number and zone/project only
+  (the bay's choice), every word in any order.
 - Columns read, by title: Primary, Work Order Type, Project & Zone Number,
   Complete, Scheduled Start Date, Scheduled End Date, Work Record URL,
   F_Profile (the leading number is shown as the gauge chip), Designer.

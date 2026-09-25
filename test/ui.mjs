@@ -100,35 +100,83 @@ console.log('\nboot');
 check('setup screen shown when unconfigured', active('screen-setup'), true);
 
 /* ------------------------------------------------------------ work orders */
-console.log('\nwork orders from the Smartsheet report');
+console.log('\nwork orders from the Smartsheet reports');
 const cell = (col, value, displayValue) => ({ virtualColumnId: col, value, displayValue });
-w.fetch = async () => ({ ok: true, json: async () => ({
-  columns: ['Primary', 'Work Order Type', 'Project & Zone Number', 'Complete', 'F_Profile', 'Designer']
-    .map((title, i) => ({ title, virtualId: i + 1 })),
-  rows: [
-    { id: 1, sheetId: 2, cells: [cell(1, 'W-100'), cell(2, 'FRAMECAD'), cell(3, 'UNIT 5'), cell(4, 'Not Started'),
-                                 cell(5, '90mm x 0.75'), cell(6, 'des@austruss.com.au', 'Dee Signer')] },
-    { id: 3, sheetId: 2, cells: [cell(1, 'W-101'), cell(2, 'STRUCTURAL'), cell(3, 'ZONE 1'), cell(4, 'Not Started')] },
-    { id: 4, sheetId: 2, cells: [cell(1, 'W-102'), cell(2, 'FRAMECAD'), cell(3, 'ZONE 2'), cell(4, 'Complete')] }
-  ] }) });
+const COLS = ['Primary', 'Work Order Type', 'Project & Zone Number', 'Complete', 'F_Profile', 'Designer']
+  .map((title, i) => ({ title, virtualId: i + 1 }));
+const woRow = (id, wo, type, zone, complete, extra) =>
+  ({ id, sheetId: 2, cells: [cell(1, wo), cell(2, type), cell(3, zone), cell(4, complete)].concat(extra || []) });
+const SCHEDULE = [
+  woRow(1, 'W-100', 'FRAMECAD', 'UNIT 5', 'Not Started', [cell(5, '90mm x 0.75'), cell(6, 'des@austruss.com.au', 'Dee Signer')]),
+  woRow(3, 'W-101', 'STRUCTURAL', 'ZONE 1', 'Not Started'),
+  woRow(4, 'W-102', 'FRAMECAD', 'ZONE 2', 'Complete')
+];
+// The all-work-orders report: 3 pages of 500 would be 1500 rows; 1100 here,
+// so the last page is short. Every 4th is Complete; W-20000 is a 26040 job.
+const ALL = Array.from({ length: 1100 }, (_, i) => woRow(10000 + i, 'W-' + (20000 + i), 'FRAMECAD',
+  i === 0 ? '26040 - Wagga Wagga - 5' : 'ZONE ' + i, i % 4 === 3 ? 'Complete' : 'Not Started'));
+const reportCalls = [];
+function reportRoute(url){
+  const m = String(url).match(/\/api\/reports\/(\d+)\?pageSize=(\d+)&page=(\d+)/);
+  if(!m) return null;
+  reportCalls.push(m[1] + ' p' + m[3]);
+  const all = m[1] === '672067532836740' ? ALL : SCHEDULE;
+  const size = +m[2], page = +m[3];
+  return { columns: COLS, totalRowCount: all.length, rows: all.slice((page - 1) * size, page * size) };
+}
+w.fetch = async (url) => {
+  const body = reportRoute(url);
+  return { ok: true, json: async () => body || [], text: async () => '' };
+};
 w.eval("Store.setWorkerUrl('https://x.workers.dev'); Store.setAppKey('k');");
 const jobs = JSON.parse(await w.eval('getWorkOrders().then(j => JSON.stringify(j))'));
-check('only FRAMECAD jobs that are not Complete', jobs.map(j => j.workOrderId), ['W-100']);
+check('FRAMECAD jobs only, any status (the list decides which statuses show)', jobs.map(j => j.workOrderId), ['W-100', 'W-102']);
 check('gauge read from F_Profile, designer by name not email', [jobs[0].gauge, jobs[0].designer], ['90', 'Dee Signer']);
+reportCalls.length = 0;
+const all = JSON.parse(await w.eval("getWorkOrders(CONFIG.ALL_REPORT_ID).then(j => JSON.stringify(j.length))"));
+check('a report past one page is fetched in full', [all, reportCalls], [1100, ['672067532836740 p1', '672067532836740 p2', '672067532836740 p3']]);
 
 /* --------------------------------------------------------------- job list */
-console.log('\njob list');
-w.eval(`
-  AppState.jobs = [
-    {rowId:1, sheetId:2, workOrderId:'W-100', zone:'UNIT 5', complete:'Not Started', gauge:'90'},
-    {rowId:5, sheetId:2, workOrderId:'W-103', zone:'ZONE 16', complete:'Partially Complete', sessionCount: 2}
-  ];
-  setTabbarVisible(true); showScreen('screen-jobs'); renderJobList();
-`);
-check('both jobs render', d.querySelectorAll('.job-card').length, 2);
-check('partial badge on the part-done job', d.querySelectorAll('.job-card .badge.partial').length, 1);
-w.eval('AppState.jobs = []; renderJobList();');
-check('no jobs shows empty state', !!d.querySelector('#jobListContainer .empty'), true);
+console.log('\njob list: Scheduled / Not completed / Completed');
+const tabs = () => [...d.querySelectorAll('#jobListTabs button')];
+const cards = () => [...d.querySelectorAll('.job-card .wo-id')].map(e => e.textContent);
+w.eval("setTabbarVisible(true); showScreen('screen-jobs');");
+reportCalls.length = 0;
+await w.eval('loadJobs(true)');
+check('Scheduled is the default list, and hides Complete jobs', [tabs()[0].classList.contains('active'), cards()], [true, ['W-100']]);
+click(tabs()[1]);
+await waitFor(() => d.querySelectorAll('.job-card').length > 1);
+check('Not completed: every open work order from the all-work-orders report', [d.querySelectorAll('.job-card').length, tabs()[1].classList.contains('active')], [825, true]);
+check('no Complete job in it', d.querySelectorAll('.job-card .badge.complete').length, 0);
+const fetchedSoFar = reportCalls.length;
+click(tabs()[2]);
+await tick(50);
+check('Completed: every Complete work order, badged green', [d.querySelectorAll('.job-card').length, d.querySelectorAll('.job-card .badge.complete').length], [275, 275]);
+check('switching between the two shares one fetch', reportCalls.length, fetchedSoFar);
+click($('btnRefreshJobs'));
+await waitFor(() => reportCalls.length > fetchedSoFar);
+check('Refresh fetches the showing list again', reportCalls.slice(fetchedSoFar)[0], '672067532836740 p1');
+
+console.log('\njob list: search');
+click(tabs()[1]);
+await tick(50);
+const search = t => { $('jobSearchInput').value = t; $('jobSearchInput').dispatchEvent(new w.Event('input')); };
+search('20000');
+check('matches the work order number', cards(), ['W-20000']);
+search('wagga 5');
+check('matches the zone, every word in any order', cards(), ['W-20000']);
+check('Clear button shows while searching', $('btnClearJobSearch').style.display, 'block');
+search('Not Started');
+check('does not match other fields (status)', d.querySelectorAll('.job-card').length, 0);
+check('says so, with the list size', (d.querySelector('#jobListContainer .empty') || {textContent: ''}).textContent.includes('825 jobs in this list'), true);
+search('26040');
+click(tabs()[0]);
+await tick(50);
+check('search carries across lists', [cards(), $('jobSearchInput').value], [[], '26040']);
+click($('btnClearJobSearch'));
+check('Clear shows the whole list again', [cards(), $('jobSearchInput').value], [['W-100'], '']);
+w.eval("AppState.jobs = []; renderJobList();");
+check('an empty list says so', (d.querySelector('#jobListContainer .empty') || {}).textContent, 'No scheduled FRAMECAD jobs found.');
 
 /* ------------------------------------------------ opening a job: files */
 console.log('\nopening a job: picking the report and drawings');
