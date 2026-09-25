@@ -208,6 +208,27 @@
   }
   .badge.not-started{background:#4A4744;color:#EDEAE5;}
   .badge.partial{background:var(--orange);color:#fff;}
+  .badge.complete{background:var(--good);color:#fff;}
+
+  /* ---------- Job list: which list + search ---------- */
+  #jobListTabs{display:flex;gap:6px;margin-bottom:10px;}
+  #jobListTabs button{
+    flex:1;min-height:var(--tap);padding:0 6px;
+    border:2px solid var(--line);border-radius:12px;
+    background:var(--card);color:var(--text);font-size:15px;font-weight:700;
+  }
+  #jobListTabs button.active{background:var(--charcoal);border-color:var(--charcoal);color:#fff;}
+  #jobSearchBar{display:flex;align-items:center;gap:8px;margin-bottom:10px;}
+  #jobSearchInput{
+    flex:1;min-height:var(--tap);
+    border:2px solid var(--line);border-radius:12px;
+    padding:0 14px;font-size:16px;background:var(--card);color:var(--text);
+  }
+  #jobSearchInput:focus{border-color:var(--orange);outline:none;}
+  #btnClearJobSearch{
+    min-height:var(--tap);padding:0 16px;border:none;border-radius:12px;
+    background:var(--charcoal-2);color:#fff;font-size:14px;font-weight:700;display:none;
+  }
 
   /* ---------- Report tab ---------- */
   #reportHeader{
@@ -480,6 +501,15 @@
     <!-- ===================== JOB LIST SCREEN ===================== -->
     <div class="screen" id="screen-jobs">
       <div class="pad">
+        <div id="jobListTabs">
+          <button data-list="scheduled" class="active">Scheduled</button>
+          <button data-list="open">Not completed</button>
+          <button data-list="completed">Completed</button>
+        </div>
+        <div id="jobSearchBar">
+          <input type="text" id="jobSearchInput" placeholder="Search work order or zone..." autocomplete="off">
+          <button id="btnClearJobSearch">Clear</button>
+        </div>
         <button class="btn secondary row-gap" id="btnRefreshJobs">Refresh list</button>
         <div id="jobListContainer"></div>
       </div>
@@ -579,6 +609,7 @@
    ========================================================================= */
 const CONFIG = {
   REPORT_ID: '7888733526249348',        // FRAMECAD - Work Orders Schedule
+  ALL_REPORT_ID: '672067532836740',     // FRAMECAD - Work Orders (every work order, any status)
   WORK_ORDER_SHEET_ID: '8417646009601924', // "Work Order" source sheet
   JOB_TYPE_FILTER: 'FRAMECAD',
   UPLOAD_CAP_BYTES: 30 * 1024 * 1024,
@@ -801,8 +832,25 @@ async function uploadAttachmentBytes(sheetId, {rowId, attachmentId, filename, mo
 /* =========================================================================
    SMARTSHEET DATA HELPERS
    ========================================================================= */
-async function getWorkOrders(){
-  const data = await ssGet('/reports/' + CONFIG.REPORT_ID + '?pageSize=500');
+// Every row of a report. Reports come back a page at a time; the all-work-
+// orders report is well past one page (892 rows in Sept 2026), so keep asking
+// until totalRowCount is reached. Capped so a bad response can't loop forever.
+async function getReportData(reportId){
+  const PAGE_SIZE = 500;
+  let data = null, rows = [];
+  for(let page = 1; page <= 50; page++){
+    const d = await ssGet('/reports/' + reportId + '?pageSize=' + PAGE_SIZE + '&page=' + page);
+    if(!data) data = d;
+    rows = rows.concat(d.rows || []);
+    if(!(d.rows || []).length || rows.length >= (d.totalRowCount || 0)) break;
+  }
+  return { columns: data.columns || [], rows };
+}
+
+// Every FRAMECAD work order in a report, any status. Which statuses show is
+// up to the job list (see JOB_LISTS).
+async function getWorkOrders(reportId){
+  const data = await getReportData(reportId || CONFIG.REPORT_ID);
   // Map column titles -> virtualColumnId for this report.
   const colByTitle = {};
   data.columns.forEach(c => { colByTitle[c.title] = c.virtualId; });
@@ -841,8 +889,7 @@ async function getWorkOrders(){
       gauge: gaugeMatch ? gaugeMatch[1] : null,
       designer: cellDisplayValue(cellFor(row, 'Designer')) || null
     };
-  }).filter(j => (j.workOrderType || '').toUpperCase() === CONFIG.JOB_TYPE_FILTER
-               && j.complete !== 'Complete');
+  }).filter(j => (j.workOrderType || '').toUpperCase() === CONFIG.JOB_TYPE_FILTER);
 
   // No client-side re-sort — this keeps whatever row order the report
   // itself is configured with in Smartsheet.
@@ -1169,7 +1216,10 @@ async function annotateDetailerPdf(originalBytes, frames, doneSet){
    APP STATE
    ========================================================================= */
 const AppState = {
-  jobs: [],
+  jobs: [],              // the job list showing now, after its status filter
+  jobList: 'scheduled',  // which button is selected (see JOB_LISTS)
+  reportJobs: {},        // report id -> every FRAMECAD job in it, fetched once
+  jobSearchTerm: '',
   currentJob: null,
   detailerBytes: null,
   drawingsBytes: null,
@@ -1266,33 +1316,93 @@ document.getElementById('btnChangeToken').addEventListener('click', () => {
 /* =========================================================================
    JOB LIST
    ========================================================================= */
-document.getElementById('btnRefreshJobs').addEventListener('click', loadJobs);
+// The three job lists. "Not completed" and "Completed" share one report, so
+// switching between them doesn't fetch it again.
+const JOB_LISTS = {
+  scheduled: { report: CONFIG.REPORT_ID, keep: j => j.complete !== 'Complete',
+               empty: 'No scheduled FRAMECAD jobs found.' },
+  open:      { report: CONFIG.ALL_REPORT_ID, keep: j => j.complete !== 'Complete',
+               empty: 'No open FRAMECAD work orders found.' },
+  completed: { report: CONFIG.ALL_REPORT_ID, keep: j => j.complete === 'Complete',
+               empty: 'No completed FRAMECAD work orders found.' }
+};
 
-async function loadJobs(){
+document.getElementById('btnRefreshJobs').addEventListener('click', () => loadJobs(true));
+document.querySelectorAll('#jobListTabs button').forEach(btn => {
+  btn.addEventListener('click', () => {
+    AppState.jobList = btn.dataset.list;
+    document.querySelectorAll('#jobListTabs button').forEach(b => b.classList.toggle('active', b === btn));
+    loadJobs(false);
+  });
+});
+
+document.getElementById('jobSearchInput').addEventListener('input', (e) => {
+  AppState.jobSearchTerm = e.target.value;
+  document.getElementById('btnClearJobSearch').style.display = AppState.jobSearchTerm ? 'block' : 'none';
+  renderJobList();
+});
+document.getElementById('btnClearJobSearch').addEventListener('click', () => {
+  AppState.jobSearchTerm = '';
+  document.getElementById('jobSearchInput').value = '';
+  document.getElementById('btnClearJobSearch').style.display = 'none';
+  renderJobList();
+});
+
+// Matches work order number and zone/project on every word typed, in any
+// order, so "wagga 5" finds "26040 - Wagga Wagga - 5".
+function jobMatches(job, term){
+  if(!term) return true;
+  const hay = [job.workOrderId, job.zone].join(' ').toLowerCase();
+  return term.toLowerCase().split(/\s+/).filter(Boolean).every(w => hay.includes(w));
+}
+
+// force: fetch the report again even if it's already been loaded (Refresh).
+async function loadJobs(force){
+  const listName = AppState.jobList;
+  const list = JOB_LISTS[listName];
   const container = document.getElementById('jobListContainer');
+  const cached = AppState.reportJobs[list.report];
+  if(cached && !force){
+    AppState.jobs = cached.filter(list.keep);
+    renderJobList();
+    return;
+  }
   container.innerHTML = '<div class="spinner"></div>';
   try{
-    AppState.jobs = await getWorkOrders();
+    const jobs = await getWorkOrders(list.report);
+    AppState.reportJobs[list.report] = jobs;
+    // Tapped another list while this one loaded: that tap renders its own.
+    if(AppState.jobList !== listName) return;
+    AppState.jobs = jobs.filter(list.keep);
     renderJobList();
     // Session counts render after the main list — no need to hold up the
-    // list itself waiting on a second sheet fetch.
+    // list itself waiting on a second fetch.
     const counts = await getSessionCounts();
-    AppState.jobs.forEach(j => { j.sessionCount = counts[j.workOrderId] || 0; });
-    renderJobList();
+    jobs.forEach(j => { j.sessionCount = counts[j.workOrderId] || 0; });
+    if(AppState.jobList === listName) renderJobList();
   }catch(e){
-    container.innerHTML = '<div class="empty">Couldn\'t load jobs.<br>' + escapeHtml(e.message) + '</div>';
+    if(AppState.jobList === listName)
+      container.innerHTML = '<div class="empty">Couldn\'t load jobs.<br>' + escapeHtml(e.message) + '</div>';
   }
 }
 
 function renderJobList(){
   const container = document.getElementById('jobListContainer');
   if(!AppState.jobs.length){
-    container.innerHTML = '<div class="empty">No scheduled FRAMECAD jobs found.</div>';
+    container.innerHTML = '<div class="empty">' + escapeHtml(JOB_LISTS[AppState.jobList].empty) + '</div>';
+    return;
+  }
+  const term = (AppState.jobSearchTerm || '').trim();
+  const visible = AppState.jobs.filter(j => jobMatches(j, term));
+  if(!visible.length){
+    container.innerHTML = '<div class="empty">No jobs match &ldquo;' + escapeHtml(term) + '&rdquo;<br>' +
+      AppState.jobs.length + ' job' + (AppState.jobs.length === 1 ? '' : 's') + ' in this list.</div>';
     return;
   }
   container.innerHTML = '';
-  AppState.jobs.forEach(job => {
-    const badgeClass = job.complete === 'Partially Complete' ? 'partial' : 'not-started';
+  visible.forEach(job => {
+    const badgeClass = job.complete === 'Partially Complete' ? 'partial'
+                     : job.complete === 'Complete' ? 'complete' : 'not-started';
     const sessionCount = job.sessionCount || 0;
     const div = document.createElement('div');
     div.className = 'job-card';
@@ -2210,7 +2320,7 @@ function boot(){
   setTabbarVisible(true);
   setActiveTab('jobs');
   showScreen('screen-jobs');
-  loadJobs();
+  loadJobs(true);
 }
 boot();
 </script>
