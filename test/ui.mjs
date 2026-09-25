@@ -67,6 +67,10 @@ w.PDFLib = {};
 w.HTMLCanvasElement.prototype.getContext = () => ({});
 w.fetch = async () => ({ ok: true, json: async () => ({}), text: async () => '' });
 
+// jsdom has no layout, so scrollTop is always 0. Give the one scrolling
+// area (#content) a plain value so the app's scroll keeping can be checked.
+{ let top = 0; Object.defineProperty(d.getElementById('content'), 'scrollTop', { get: () => top, set: v => { top = v; } }); }
+
 const runtimeErrors = [];
 w.addEventListener('error', e => runtimeErrors.push(e.message));
 // Button handlers are async, so their errors surface as rejections, not
@@ -271,6 +275,13 @@ click([...d.querySelectorAll('#modalList .pick-row')].pop());
 await waitFor(() => !$('modalOverlay').classList.contains('show') && d.querySelectorAll('#frameList .frame-row').length === 3);
 check('choosing it opens the job with no drawings', [w.eval('AppState.drawingsPdf'), d.querySelector('#tabbar button[data-tab="drawings"]').style.display], [null, 'none']);
 
+// A different job starts at the top of its list, not where the last one was.
+w.eval("showScreen('screen-report')"); $('content').scrollTop = 500; w.eval("showScreen('screen-jobs')");
+rowAttachments = [];
+w.eval("openJob({rowId:8, sheetId:2, workOrderId:'W-2', zone:'Y'})");
+check('opening another job starts at the top', [active('screen-report'), $('content').scrollTop], [true, 0]);
+await tick(50);
+
 // The real bridging row (W-13859): report plus Smartsheet's generated files
 // only. Those are never offered, so it opens straight away as report-only.
 rowAttachments = [att(50, 'Mapping for Work Order Weld Label.pdf'), att(51, 'Cover Page_W-13859_310826 729 PM.pdf'),
@@ -369,9 +380,14 @@ w.eval("AppState.frames = window.__savedFrames; AppState.doneSet = new Set(['L50
 
 /* -------------------------------------------------------- view drawing */
 console.log('\nview drawing (📄)');
+$('content').scrollTop = 800;   // scrolled well down the frame list
 click(rows()[1].querySelector('.btn-view-drawing'));
 await tick(50);
 check('jumps to the frame\'s drawing page', [active('screen-drawings'), w.eval('AppState.drawingsPage')], [true, 2]);
+check('the drawings screen starts at the top', $('content').scrollTop, 0);
+click(d.querySelector('#tabbar button[data-tab="report"]'));
+check('back on the Report tab, the list is where you left it', [active('screen-report'), $('content').scrollTop], [true, 800]);
+$('content').scrollTop = 0;
 check('page tag chips shown', d.querySelectorAll('#pageTagRow .tag-chip').length, 1);
 w.eval("showScreen('screen-report')");
 click(rows()[2].querySelector('.btn-view-drawing'));
