@@ -92,7 +92,8 @@ function loadParsers(){
   };
   const fn = new Function(...Object.keys(ctx), code + `
     return { CONFIG, loadPdf, extractDetailerReport, buildDrawingIndex,
-             annotateDetailerPdf, extractTags, markupKeywords, parseMarkupKeywords };`);
+             annotateDetailerPdf, extractTags, markupKeywords, parseMarkupKeywords,
+             findDrawingPage };`);
   return fn(...Object.values(ctx));
 }
 
@@ -141,34 +142,34 @@ async function checkDrawings(file){
   console.table(pages.map(p => ({ page: p.page, drawing: p.drawingNumber, tags: p.tags.join(', ') })));
   const unidentified = pages.filter(p => !p.drawingNumber).map(p => p.page);
   console.log('  ' + (pages.length - unidentified.length) + ' of ' + pages.length + ' pages identified');
-  if(unidentified.length){
-    // Say whether the page has any text at all: a flattened or scanned page
-    // can't be read by any rule, which is a different problem from a layout
-    // the rules don't know yet.
-    const noText = [];
-    for(const n of unidentified){
-      const c = await (await pdf.getPage(n)).getTextContent();
-      if(!c.items.some(i => i.str.trim())) noText.push(n);
-    }
-    fail(unidentified.length + ' page(s) with no drawing number: ' + list(unidentified) +
-         (noText.length === unidentified.length ? ' (no text layer at all: flattened or scanned)'
-          : noText.length ? ' (' + noText.length + ' of them have no text layer)' : ''));
+  // A page with no text at all (flattened or scanned) can't be read by any
+  // rule. The bay is fine with that as long as it can be viewed: it's shown
+  // as "Pg N" and its frames get no 📄 button. Only pages that DO have text
+  // but no drawing number are a problem (a layout the rules don't know yet).
+  const noText = [];
+  for(const n of unidentified){
+    const c = await (await pdf.getPage(n)).getTextContent();
+    if(!c.items.some(i => i.str.trim())) noText.push(n);
   }
+  const unknown = unidentified.filter(n => !noText.includes(n));
+  if(noText.length) console.log('  ' + noText.length + ' page(s) with no text layer (expected: viewable, no 📄): ' + list(noText));
+  if(unknown.length) fail(unknown.length + ' page(s) with text but no drawing number: ' + list(unknown));
+  pages.noTextPages = noText.length;
   const nums = pages.map(p => p.drawingNumber).filter(Boolean);
   const dupes = nums.filter((n, i) => nums.indexOf(n) !== i);
   if(dupes.length) console.log('  note: drawing number on more than one page: ' + list([...new Set(dupes)]));
   return pages;
 }
 
-// Can the 📄 button on each frame find its drawing? This mirrors the match in
-// jumpToFrameDrawing (exact, upper-cased). That function lives below the APP
-// STATE banner, so it can't be called from here; if the match moves into a
-// helper above the banner, call that helper here instead.
+// Can the 📄 button on each frame find its drawing? Uses the app's own
+// findDrawingPage, the same match the button uses. When the whole drawings
+// file has no text, no frame can find a page; that's expected (see above).
 function checkPair(frames, pages){
-  const nums = new Set(pages.map(p => p.drawingNumber).filter(Boolean));
-  const missing = frames.filter(f => !nums.has(f.name.toUpperCase())).map(f => f.name);
+  const missing = frames.filter(f => !api.findDrawingPage(pages, f.name)).map(f => f.name);
   console.log('  view drawing: ' + (frames.length - missing.length) + ' of ' + frames.length + ' frames find their page');
-  if(missing.length) fail(missing.length + ' frame(s) whose 📄 button finds no drawing: ' + list(missing));
+  if(!missing.length) return;
+  if(pages.noTextPages === pages.length) console.log('  (expected: the drawings have no text, so these frames get no 📄 button)');
+  else fail(missing.length + ' frame(s) whose 📄 button finds no drawing: ' + list(missing));
 }
 
 /* -------------------------------------------------------------------- main */

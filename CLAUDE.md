@@ -117,7 +117,13 @@ Facts from the bay, not visible in the code:
   `GI100-2 (GI100-1 (WELD))` are the same idea.
 - **Split frames:** `N504.A` / `N504.B` (26018) and `NB2047-A` / `-B` / `-C`
   (24477) are parts of one frame, all built from the one drawing (`N504`,
-  `NB2047`).
+  `NB2047`). Both can combine: `HN146-1-C` (Zone 16 trusses) is drawing
+  `HN146`. `findDrawingPage` does this matching (exact match first, then
+  everything from the first `-` or `.` dropped); 📄 only shows on frames it
+  finds a page for.
+- **Report-only jobs** open with no drawings: the Drawings tab is hidden, and
+  when the row has other PDFs the drawings picker offers "No drawings for this
+  job (report only)".
 - Pack lists (e.g. `24477-LGS-C1-621 … Pack lists`) will be used later; the
   app ignores them for now.
 
@@ -187,15 +193,15 @@ ones. So opening a job always goes back to a clean report version
 Measured by the tests against `samples/`; each is pinned so a fix is a
 deliberate change to the test.
 
-- **📄 can't find the drawing** for copies (`N101-1` vs drawing `N101`, all 163
-  truss frames in Zone 16) and parts (`NB2047-A`, 19 frames in 24477). The
-  match in `jumpToFrameDrawing` is exact.
-- **📄 shows on every frame**, even when there's nothing to go to.
-- **A report-only job can't open.** After picking the report, the app asks for
-  drawings from an empty list.
 - **Drawings with no text layer** (`150 Bulkhead Frames Z1 - Production
-  Drawing.pdf`, flattened) can't be identified by any rule. The structural app
-  shows a hint on such pages; not ported yet.
+  Drawing.pdf`, flattened) can't be identified by any rule. The bay accepts
+  that as long as they can be viewed: the pages show as "Pg N" and their
+  frames get no 📄. The tests report this as expected. The structural app
+  shows a hint on such pages; not ported (the bay didn't ask for it).
+- When a row has the report plus exactly one other PDF, that PDF is taken as
+  the drawings without asking, even if it's, say, a pack list.
+- Nested labels like `GI100-2 (GI100-1 (WELD))` wouldn't match `rowRe`; no
+  sample has one yet.
 - Uploads show as authored by whoever owns the Worker's token, not the operator.
 - If whoever owns the Worker's Smartsheet token also uploads reports from that
   same login, the app will take those uploads for its own saves and skip them

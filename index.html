@@ -1173,6 +1173,23 @@ async function buildDrawingIndex(pdfDoc){
   return pages;
 }
 
+// Which drawing page a report frame is built from, or null. An exact match
+// wins. Otherwise the frame is a copy or a part of one drawing, and the
+// report adds a suffix the drawing doesn't have:
+//  - copies: N101-1, N101-2 … all built from drawing N101 (GF290-1, GI100-2);
+//  - split frames: N504.A / N504.B and NB2047-A / -B / -C, parts of one
+//    frame on drawing N504 / NB2047.
+// Drawing numbers themselves never contain "-" or "." (see
+// DRAWING_NUMBER_TOKEN_RE), so dropping everything from the first one on
+// leaves the drawing number.
+function findDrawingPage(pages, frameName){
+  const name = String(frameName || '').toUpperCase();
+  const exact = pages.find(p => p.drawingNumber === name);
+  if(exact) return exact;
+  const m = name.match(/^([A-Z]{1,6}\d{2,6})[.\-][A-Z0-9.\-]+$/);
+  return m ? pages.find(p => p.drawingNumber === m[1]) || null : null;
+}
+
 /* =========================================================================
    PDF ANNOTATION (pdf-lib) — marks completed frame rows on a copy of the
    original detailer report before it's uploaded back to Smartsheet.
@@ -1228,6 +1245,7 @@ const AppState = {
   drawingsPageCount: 0,
   drawingPages: [],
   drawingIndexPromise: null,
+  drawingIndexReady: false,
   frames: [],
   header: null,
   doneSet: new Set(),
@@ -1474,6 +1492,9 @@ async function openJob(job){
   }
 }
 
+// Picker entry for a job whose other PDFs aren't drawings (report only).
+const NO_DRAWINGS = { id: 'none', name: 'No drawings for this job (report only)' };
+
 function pickAttachmentsManually(list, guessedDetailer, guessedDrawings){
   if(!list.length){
     document.getElementById('frameList').innerHTML =
@@ -1483,11 +1504,14 @@ function pickAttachmentsManually(list, guessedDetailer, guessedDrawings){
   checkForRevisions(AppState.currentJob, list);
   openModal('Which file is the detailer report?', list, async (detailerAtt) => {
     const rest = list.filter(a => a !== detailerAtt);
-    if(rest.length === 1){
+    if(!rest.length){
+      // Report-only job: studs, bridging and other plain sticks.
+      await loadJobFiles(detailerAtt, null);
+    } else if(rest.length === 1){
       await loadJobFiles(detailerAtt, rest[0]);
     } else {
-      openModal('Which file has the production drawings?', rest, async (drawingsAtt) => {
-        await loadJobFiles(detailerAtt, drawingsAtt);
+      openModal('Which file has the production drawings?', rest.concat([NO_DRAWINGS]), async (drawingsAtt) => {
+        await loadJobFiles(detailerAtt, drawingsAtt === NO_DRAWINGS ? null : drawingsAtt);
       });
     }
   }, guessedDetailer);
@@ -1506,7 +1530,7 @@ function openModal(title, list, cb, highlighted){
     row.innerHTML = '<div class="fname">' + escapeHtml(att.name) +
       (att === highlighted ? '  <span style="color:var(--orange);">(likely)</span>' : '') +
       (att.revised ? revisionChip() : '') + '</div>' +
-      '<div class="fdate">Uploaded ' + escapeHtml(att.createdAt || '') + '</div>';
+      (att.createdAt ? '<div class="fdate">Uploaded ' + escapeHtml(att.createdAt) + '</div>' : '');
     row.addEventListener('click', () => { closeModal(); cb(att); });
     listEl.appendChild(row);
   });
@@ -1620,13 +1644,21 @@ async function loadJobFiles(detailerAtt, drawingsAtt){
   AppState.searchTerm = '';
   document.getElementById('searchInput').value = '';
   document.getElementById('btnClearSearch').style.display = 'none';
+  // Forget the previous job's drawings before anything renders, so no 📄
+  // button can point into them. drawingsAtt is null for a report-only job
+  // (studs, bridging and other plain sticks have no drawings).
+  AppState.drawingsPdf = null;
+  AppState.drawingPages = [];
+  AppState.drawingIndexPromise = null;
+  AppState.drawingIndexReady = false;
+  document.querySelector('#tabbar button[data-tab="drawings"]').style.display = drawingsAtt ? '' : 'none';
   // The report comes from its clean version, never from one of our own
   // marked-up saves. Drawings are never written by the app: latest is fine.
   AppState.detailerAtt = detailerAtt;
   AppState.detailerSource = null;
   const [detailerBytes, drawingsBytes] = await Promise.all([
     loadWorkingDetailer(detailerAtt),
-    downloadAttachmentBytes(AppState.currentJob.sheetId, drawingsAtt.id)
+    drawingsAtt ? downloadAttachmentBytes(AppState.currentJob.sheetId, drawingsAtt.id) : null
   ]);
   AppState.detailerBytes = detailerBytes;
   AppState.drawingsBytes = drawingsBytes;
@@ -1660,23 +1692,29 @@ async function loadJobFiles(detailerAtt, drawingsAtt){
     if(document.getElementById('screen-report').classList.contains('active')) renderFrameList();
   });
 
+  if(drawingsBytes){
+    AppState.drawingsPdf = await loadPdf(drawingsBytes.slice(0));
+    AppState.drawingsPageCount = AppState.drawingsPdf.numPages;
+    AppState.drawingsPage = 1;
+    // Runs in the background — the report tab is usable immediately, and the
+    // jump/search modal just awaits this promise if it isn't done yet.
+    const job = AppState.currentJob;
+    AppState.drawingIndexPromise = buildDrawingIndex(AppState.drawingsPdf)
+      .then(pages => {
+        if(AppState.currentJob !== job) return;
+        AppState.drawingPages = pages;
+        AppState.drawingIndexReady = true;
+        // If the operator is already looking at the drawings tab, the tag
+        // chips for the current page won't have had data yet — refresh once.
+        if(document.getElementById('screen-drawings').classList.contains('active')){
+          updatePageTagRow();
+        }
+        // Now it's known which frames have a drawing: drop the 📄 buttons
+        // that have nothing to go to.
+        if(document.getElementById('screen-report').classList.contains('active')) renderFrameList();
+      });
+  }
   renderFrameList();
-
-  AppState.drawingsPdf = await loadPdf(drawingsBytes.slice(0));
-  AppState.drawingsPageCount = AppState.drawingsPdf.numPages;
-  AppState.drawingsPage = 1;
-  AppState.drawingPages = [];
-  // Runs in the background — the report tab is usable immediately, and the
-  // jump/search modal just awaits this promise if it isn't done yet.
-  AppState.drawingIndexPromise = buildDrawingIndex(AppState.drawingsPdf)
-    .then(pages => {
-      AppState.drawingPages = pages;
-      // If the operator is already looking at the drawings tab, the tag
-      // chips for the current page won't have had data yet — refresh once.
-      if(document.getElementById('screen-drawings').classList.contains('active')){
-        updatePageTagRow();
-      }
-    });
 
   setTabbarVisible(true);
   setActiveTab('report');
@@ -1720,13 +1758,14 @@ function renderFrameList(){
         '</div>' +
       '</div>' +
       '<div class="row-actions">' +
-        '<button class="row-action-btn btn-view-drawing" title="View drawing">&#128196;</button>' +
+        (hasDrawing(f) ? '<button class="row-action-btn btn-view-drawing" title="View drawing">&#128196;</button>' : '') +
         '<button class="row-action-btn btn-note-issue' + (issues.length ? ' has-issue' : '') + '" title="Note an issue">&#9873;' +
           (issues.length ? '<span class="issue-count">' + issues.length + '</span>' : '') +
         '</button>' +
       '</div>';
 
-    row.querySelector('.btn-view-drawing').addEventListener('click', (e) => {
+    const viewBtn = row.querySelector('.btn-view-drawing');
+    if(viewBtn) viewBtn.addEventListener('click', (e) => {
       e.stopPropagation();
       jumpToFrameDrawing(f);
     });
@@ -1769,10 +1808,19 @@ function persistProgress(){
 /* =========================================================================
    JUMP TO DRAWING — reuses the same drawing-number index built for search.
    ========================================================================= */
+// Whether a frame gets a 📄 button. While the drawings are still being
+// indexed every frame keeps one (tapping it waits for the index); once the
+// index is ready, only frames with a drawing page do. No drawings: none.
+function hasDrawing(f){
+  if(!AppState.drawingsPdf) return false;
+  if(!AppState.drawingIndexReady) return true;
+  return !!findDrawingPage(AppState.drawingPages, f.name);
+}
+
 function jumpToFrameDrawing(f){
   if(!AppState.drawingsPdf){ toast('Drawings not loaded yet', 'err'); return; }
   const go = () => {
-    const entry = AppState.drawingPages.find(p => p.drawingNumber === f.name.toUpperCase());
+    const entry = findDrawingPage(AppState.drawingPages, f.name);
     if(entry){
       showScreen('screen-drawings');
       setActiveTab('drawings');
@@ -1781,7 +1829,7 @@ function jumpToFrameDrawing(f){
       toast('No drawing found for ' + f.name, 'err');
     }
   };
-  if(AppState.drawingPages.length || !AppState.drawingIndexPromise){
+  if(AppState.drawingIndexReady || !AppState.drawingIndexPromise){
     go();
   } else {
     toast('Finding drawing\u2026');

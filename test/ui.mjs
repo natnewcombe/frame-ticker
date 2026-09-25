@@ -78,7 +78,7 @@ process.on('unhandledRejection', e => runtimeErrors.push('unhandled rejection: '
 const code = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(x => x[1]).join('\n');
 const expose = '\n;Object.assign(window,{Store,AppState,CONFIG,renderJobList,renderFrameList,showScreen,' +
                'setTabbarVisible,openJob,getWorkOrders,renderSessionList,updateSessionBar,' +
-               'pickWorkingVersion,markupKeywords,parseMarkupKeywords,loadWorkingDetailer});';
+               'pickWorkingVersion,markupKeywords,parseMarkupKeywords,loadWorkingDetailer,findDrawingPage});';
 try{
   w.eval(code + expose);
 }catch(e){
@@ -229,11 +229,28 @@ w.eval("openJob({rowId:9, sheetId:2, workOrderId:'W-104', zone:'UNIT 5 STUDS'})"
 await waitFor(() => $('modalOverlay').classList.contains('show'));
 check('report-only job: asks which file is the report', $('modalTitle').textContent, 'Which file is the detailer report?');
 click(d.querySelector('#modalList .pick-row'));
-await tick(50);
-gap('report-only job: then asks for drawings from an empty list, and never opens',
-  [$('modalTitle').textContent, d.querySelectorAll('#modalList .pick-row').length, $('modalOverlay').classList.contains('show')],
-  ['Which file has the production drawings?', 0, true]);
-w.eval('closeModal()');
+await waitFor(() => d.querySelectorAll('#frameList .frame-row').length === 3);
+check('report-only job: opens straight away with just the report',
+  [$('modalOverlay').classList.contains('show'), active('screen-report'), d.querySelectorAll('#frameList .frame-row').length],
+  [false, true, 3]);
+check('report-only job: no Drawings tab and no 📄 buttons',
+  [d.querySelector('#tabbar button[data-tab="drawings"]').style.display, d.querySelectorAll('#frameList .btn-view-drawing').length],
+  ['none', 0]);
+check('report-only job: only the report is downloaded',
+  calls.filter(c => c.url.includes('/download')).map(c => new URL(c.url).searchParams.get('attachmentId')), ['40']);
+
+// Report plus two other PDFs that aren't drawings (e.g. a pack list): the
+// drawings picker offers "No drawings".
+rowAttachments = [att(41, '90mm STUDS REPORT.pdf'), att(42, 'Pack lists.pdf'), att(43, 'Other.pdf')];
+w.eval("openJob({rowId:9, sheetId:2, workOrderId:'W-104', zone:'UNIT 5 STUDS'})");
+await waitFor(() => $('modalOverlay').classList.contains('show'));
+click(d.querySelector('#modalList .pick-row'));
+await waitFor(() => $('modalTitle').textContent === 'Which file has the production drawings?');
+const drawingChoices = [...d.querySelectorAll('#modalList .pick-row .fname')].map(e => e.textContent.trim());
+check('drawings picker offers "No drawings" last', drawingChoices[drawingChoices.length - 1], 'No drawings for this job (report only)');
+click([...d.querySelectorAll('#modalList .pick-row')].pop());
+await waitFor(() => !$('modalOverlay').classList.contains('show') && d.querySelectorAll('#frameList .frame-row').length === 3);
+check('choosing it opens the job with no drawings', [w.eval('AppState.drawingsPdf'), d.querySelector('#tabbar button[data-tab="drawings"]').style.display], [null, 'none']);
 
 // Normal job. The real report names don't match CONFIG.DETAILER_NAME_RE, so
 // the operator picks it; the bay has accepted that.
@@ -246,6 +263,7 @@ click(d.querySelectorAll('#modalList .pick-row')[0]);
 await waitFor(() => d.querySelectorAll('#frameList .frame-row').length === 3);
 const downloads = calls.filter(c => c.url.includes('/download')).map(c => new URL(c.url).searchParams.get('attachmentId'));
 check('with one file left, it is taken as the drawings: both downloaded', downloads.slice(-2).sort(), ['10', '11']);
+check('the Drawings tab is back for a job with drawings', d.querySelector('#tabbar button[data-tab="drawings"]').style.display, '');
 check('remembers which clean report version it works from',
   w.eval('JSON.stringify(AppState.detailerSource)'), '{"sourceId":10,"skipId":null}');
 check('report screen shows every frame', d.querySelectorAll('#frameList .frame-row').length, 3);
@@ -281,8 +299,19 @@ check('page tag chips shown', d.querySelectorAll('#pageTagRow .tag-chip').length
 w.eval("showScreen('screen-report')");
 click(rows()[2].querySelector('.btn-view-drawing'));
 await tick(50);
-gap('a copy (N101-1) does not find its drawing (N101)', $('toast').textContent, 'No drawing found for N101-1');
-gap('every frame gets a 📄 button, even with no drawing to go to', d.querySelectorAll('#frameList .btn-view-drawing').length, 3);
+check('a copy (N101-1) opens its drawing (N101)', [active('screen-drawings'), w.eval('AppState.drawingsPage')], [true, 3]);
+w.eval("showScreen('screen-report')");
+check('matching: exact, copies, split frames, and nothing else', JSON.parse(w.eval(`JSON.stringify((function(){
+  var pages = [{page:1, drawingNumber:'N504'}, {page:2, drawingNumber:'NB2047'}, {page:3, drawingNumber:'N101'}, {page:4, drawingNumber:'N101A'}];
+  return ['N101', 'N101-1', 'N101-12', 'N504.A', 'NB2047-C', 'N101A', 'N102-1', 'N5040', 'N50'].map(function(n){
+    var p = findDrawingPage(pages, n); return p ? p.page : null; });
+})())`)), [3, 3, 3, 1, 2, 4, null, null, null]);
+// A drawings set missing N101: that frame loses its 📄, the others keep theirs.
+w.eval("AppState.drawingPages = AppState.drawingPages.filter(function(p){ return p.drawingNumber !== 'N101'; }); renderFrameList();");
+check('📄 only on frames that have a drawing', [...rows()].map(r => !!r.querySelector('.btn-view-drawing')), [true, true, false]);
+w.eval("AppState.drawingIndexReady = false; renderFrameList();");
+check('while drawings are still being read, every frame keeps its 📄', d.querySelectorAll('#frameList .btn-view-drawing').length, 3);
+w.eval("AppState.drawingIndexReady = true; AppState.drawingPages.push({page:3, drawingNumber:'N101', tags:[]}); renderFrameList();");
 
 /* ------------------------------------------------- start job + save */
 console.log('\nstart job and save progress');
