@@ -111,18 +111,33 @@ const SCHEDULE = [
   woRow(3, 'W-101', 'STRUCTURAL', 'ZONE 1', 'Not Started'),
   woRow(4, 'W-102', 'FRAMECAD', 'ZONE 2', 'Complete')
 ];
-// The all-work-orders report: 3 pages of 500 would be 1500 rows; 1100 here,
-// so the last page is short. Every 4th is Complete; W-20000 is a 26040 job.
-const ALL = Array.from({ length: 1100 }, (_, i) => woRow(10000 + i, 'W-' + (20000 + i), 'FRAMECAD',
-  i === 0 ? '26040 - Wagga Wagga - 5' : 'ZONE ' + i, i % 4 === 3 ? 'Complete' : 'Not Started'));
+// The Work Order sheet: 1100 rows over 3 pages of 500, oldest first as a sheet
+// would be. Every 4th is Complete; W-20000 is a 26040 job; every 10th is a
+// STRUCTURAL work order. A sheet's cells use columnId (here 100+), not
+// virtualColumnId, and it has columns the app doesn't need.
+const SHEET_COLS = COLS.map(c => ({ id: 100 + c.virtualId, title: c.title }))
+  .concat([{ id: 999, title: 'QR Code' }, { id: 998, title: 'F_Coil Type' }]);
+const sheetRow = (i) => ({ id: 10000 + i, cells: [
+  { columnId: 101, value: 'W-' + (20000 + i) }, { columnId: 102, value: i % 10 === 5 ? 'STRUCTURAL' : 'FRAMECAD' },
+  { columnId: 103, value: i === 0 ? '26040 - Wagga Wagga - 5' : 'ZONE ' + i },
+  { columnId: 104, value: i % 4 === 3 ? 'Complete' : 'Not Started' }] });
+const SHEET = Array.from({ length: 1100 }, (_, i) => sheetRow(i));
 const reportCalls = [];
 function reportRoute(url){
-  const m = String(url).match(/\/api\/reports\/(\d+)\?pageSize=(\d+)&page=(\d+)/);
+  url = String(url);
+  const cols = url.match(/\/api\/sheets\/(\d+)\/columns/);
+  if(cols){ reportCalls.push('sheet columns'); return { data: SHEET_COLS }; }
+  const sh = url.match(/\/api\/sheets\/(\d+)\?columnIds=([\d,]+)&pageSize=(\d+)&page=(\d+)/);
+  if(sh){
+    reportCalls.push('sheet ' + sh[1] + ' p' + sh[4] + ' cols ' + sh[2]);
+    const size = +sh[3], page = +sh[4];
+    return { totalRowCount: SHEET.length, rows: SHEET.slice((page - 1) * size, page * size) };
+  }
+  const m = url.match(/\/api\/reports\/(\d+)\?pageSize=(\d+)&page=(\d+)/);
   if(!m) return null;
   reportCalls.push(m[1] + ' p' + m[3]);
-  const all = m[1] === '672067532836740' ? ALL : SCHEDULE;
   const size = +m[2], page = +m[3];
-  return { columns: COLS, totalRowCount: all.length, rows: all.slice((page - 1) * size, page * size) };
+  return { columns: COLS, totalRowCount: SCHEDULE.length, rows: SCHEDULE.slice((page - 1) * size, page * size) };
 }
 w.fetch = async (url) => {
   const body = reportRoute(url);
@@ -133,8 +148,12 @@ const jobs = JSON.parse(await w.eval('getWorkOrders().then(j => JSON.stringify(j
 check('FRAMECAD jobs only, any status (the list decides which statuses show)', jobs.map(j => j.workOrderId), ['W-100', 'W-102']);
 check('gauge read from F_Profile, designer by name not email', [jobs[0].gauge, jobs[0].designer], ['90', 'Dee Signer']);
 reportCalls.length = 0;
-const all = JSON.parse(await w.eval("getWorkOrders(CONFIG.ALL_REPORT_ID).then(j => JSON.stringify(j.length))"));
-check('a report past one page is fetched in full', [all, reportCalls], [1100, ['672067532836740 p1', '672067532836740 p2', '672067532836740 p3']]);
+const fromSheet = JSON.parse(await w.eval("getWorkOrders(null, CONFIG.WORK_ORDER_SHEET_ID).then(j => JSON.stringify(j))"));
+check('the Work Order sheet is read in full, FRAMECAD only', fromSheet.length, 990);
+check('only the columns the app needs are downloaded, found by title',
+  reportCalls, ['sheet columns', 'sheet 8417646009601924 p1 cols 101,102,103,104,105,106', 'sheet 8417646009601924 p2 cols 101,102,103,104,105,106', 'sheet 8417646009601924 p3 cols 101,102,103,104,105,106']);
+check('sheet rows get the sheet id (reports carry their own)', [fromSheet[0].sheetId, jobs[0].sheetId], ['8417646009601924', 2]);
+check('newest work order first', [fromSheet[0].workOrderId, fromSheet[fromSheet.length - 1].workOrderId], ['W-21099', 'W-20000']);
 
 /* --------------------------------------------------------------- job list */
 console.log('\njob list: Scheduled / Not completed / Completed');
@@ -146,16 +165,16 @@ await w.eval('loadJobs(true)');
 check('Scheduled is the default list, and hides Complete jobs', [tabs()[0].classList.contains('active'), cards()], [true, ['W-100']]);
 click(tabs()[1]);
 await waitFor(() => d.querySelectorAll('.job-card').length > 1);
-check('Not completed: every open work order from the all-work-orders report', [d.querySelectorAll('.job-card').length, tabs()[1].classList.contains('active')], [825, true]);
+check('Not completed: every open FRAMECAD work order on the Work Order sheet', [d.querySelectorAll('.job-card').length, tabs()[1].classList.contains('active')], [770, true]);
 check('no Complete job in it', d.querySelectorAll('.job-card .badge.complete').length, 0);
 const fetchedSoFar = reportCalls.length;
 click(tabs()[2]);
 await tick(50);
-check('Completed: every Complete work order, badged green', [d.querySelectorAll('.job-card').length, d.querySelectorAll('.job-card .badge.complete').length], [275, 275]);
+check('Completed: every Complete FRAMECAD work order, badged green', [d.querySelectorAll('.job-card').length, d.querySelectorAll('.job-card .badge.complete').length], [220, 220]);
 check('switching between the two shares one fetch', reportCalls.length, fetchedSoFar);
 click($('btnRefreshJobs'));
 await waitFor(() => reportCalls.length > fetchedSoFar);
-check('Refresh fetches the showing list again', reportCalls.slice(fetchedSoFar)[0], '672067532836740 p1');
+check('Refresh fetches the showing list again', reportCalls.slice(fetchedSoFar)[0], 'sheet columns');
 
 console.log('\njob list: search');
 click(tabs()[1]);
@@ -168,7 +187,7 @@ check('matches the zone, every word in any order', cards(), ['W-20000']);
 check('Clear button shows while searching', $('btnClearJobSearch').style.display, 'block');
 search('Not Started');
 check('does not match other fields (status)', d.querySelectorAll('.job-card').length, 0);
-check('says so, with the list size', (d.querySelector('#jobListContainer .empty') || {textContent: ''}).textContent.includes('825 jobs in this list'), true);
+check('says so, with the list size', (d.querySelector('#jobListContainer .empty') || {textContent: ''}).textContent.includes('770 jobs in this list'), true);
 search('26040');
 click(tabs()[0]);
 await tick(50);
@@ -211,9 +230,9 @@ w.eval(`
   extractDetailerReport = async () => ({
     header: { client:'X', jobNumber:'26040', title:'UNIT 5', sectionTitle:'90_LB Walls', frameCount:3 },
     frames: [
-      {name:'L500', label:'L500', tags:[], totalLength:'20.00 m', fasteners:'40', totalWeight:'30.0 kg', extraColumns:'', page:1, y:600, x:30},
-      {name:'L501', label:'L501 (WELD)', tags:['WELD'], totalLength:'10.50 m', fasteners:'20', totalWeight:'15.0 kg', extraColumns:'', page:1, y:590, x:30},
-      {name:'N101-1', label:'N101-1', tags:[], totalLength:'5.25 m', fasteners:'12', totalWeight:'8.0 kg', extraColumns:'', page:1, y:580, x:30}
+      {name:'L500', key:'L500', label:'L500', tags:[], totalLength:'20.00 m', fasteners:'40', totalWeight:'30.0 kg', extraColumns:'', page:1, y:600, x:30},
+      {name:'L501', key:'L501', label:'L501 (WELD)', tags:['WELD'], totalLength:'10.50 m', fasteners:'20', totalWeight:'15.0 kg', extraColumns:'', page:1, y:590, x:30},
+      {name:'N101-1', key:'N101-1', label:'N101-1', tags:[], totalLength:'5.25 m', fasteners:'12', totalWeight:'8.0 kg', extraColumns:'', page:1, y:580, x:30}
     ]
   });
   buildDrawingIndex = async () => [
@@ -239,9 +258,9 @@ check('report-only job: no Drawings tab and no 📄 buttons',
 check('report-only job: only the report is downloaded',
   calls.filter(c => c.url.includes('/download')).map(c => new URL(c.url).searchParams.get('attachmentId')), ['40']);
 
-// Report plus two other PDFs that aren't drawings (e.g. a pack list): the
-// drawings picker offers "No drawings".
-rowAttachments = [att(41, '90mm STUDS REPORT.pdf'), att(42, 'Pack lists.pdf'), att(43, 'Other.pdf')];
+// Report plus two other PDFs that aren't drawings: the drawings picker
+// offers "No drawings".
+rowAttachments = [att(41, '90mm STUDS REPORT.pdf'), att(42, 'Site notes.pdf'), att(43, 'Other.pdf')];
 w.eval("openJob({rowId:9, sheetId:2, workOrderId:'W-104', zone:'UNIT 5 STUDS'})");
 await waitFor(() => $('modalOverlay').classList.contains('show'));
 click(d.querySelector('#modalList .pick-row'));
@@ -252,6 +271,47 @@ click([...d.querySelectorAll('#modalList .pick-row')].pop());
 await waitFor(() => !$('modalOverlay').classList.contains('show') && d.querySelectorAll('#frameList .frame-row').length === 3);
 check('choosing it opens the job with no drawings', [w.eval('AppState.drawingsPdf'), d.querySelector('#tabbar button[data-tab="drawings"]').style.display], [null, 'none']);
 
+// The real bridging row (W-13859): report plus Smartsheet's generated files
+// only. Those are never offered, so it opens straight away as report-only.
+rowAttachments = [att(50, 'Mapping for Work Order Weld Label.pdf'), att(51, 'Cover Page_W-13859_310826 729 PM.pdf'),
+                  att(52, 'Pack Label_W-13859.pdf'), att(53, '89 - LS BRIDGING - Report.pdf')];
+calls.length = 0;
+w.eval("openJob({rowId:9, sheetId:2, workOrderId:'W-13859', zone:'25363 - Calderwood - B1'})");
+await waitFor(() => $('modalOverlay').classList.contains('show'));
+check('Cover Page, Pack Label and Mapping are never offered',
+  [...d.querySelectorAll('#modalList .pick-row .fname')].map(e => e.textContent.trim()), ['89 - LS BRIDGING - Report.pdf']);
+click(d.querySelector('#modalList .pick-row'));
+await waitFor(() => d.querySelectorAll('#frameList .frame-row').length === 3);
+check('bridging job: opens as report-only, only the report downloaded',
+  [calls.filter(c => c.url.includes('/download')).map(c => new URL(c.url).searchParams.get('attachmentId')),
+   d.querySelector('#tabbar button[data-tab="drawings"]').style.display], [['53'], 'none']);
+
+// 24477 C2's real row: with the generated files and the pack list hidden,
+// report and drawings are all that's left, so there's no drawings picker.
+rowAttachments = [att(60, '24477-LGS-C2-600 [1] ZONE C2 - Detailer - Report - 150mm Walls.pdf'),
+                  att(61, 'Pack Label_W-12935.pdf'), att(62, 'Cover Page_W-12935_230626 213 PM.pdf'),
+                  att(63, 'Mapping for Work Order Weld Label.pdf'), att(64, '24477-LGS-C1-621 [A] ZONE C2 - Pack lists - 150mm Walls.pdf'),
+                  att(65, '24477-LGS-C2-200 [A] ZONE C2 - PRODUCTION - 150mm WALLS.pdf')];
+calls.length = 0;
+w.eval("openJob({rowId:9, sheetId:2, workOrderId:'W-12935', zone:'24477 - Tallawong - C2'})");
+await waitFor(() => $('modalOverlay').classList.contains('show'));
+check('24477 C2: pack list hidden too, leaving report and drawings', d.querySelectorAll('#modalList .pick-row').length, 2);
+click(d.querySelector('#modalList .pick-row'));
+await waitFor(() => d.querySelectorAll('#frameList .frame-row').length === 3);
+check('24477 C2: the production drawings are taken without asking',
+  calls.filter(c => c.url.includes('/download')).map(c => new URL(c.url).searchParams.get('attachmentId')).sort(), ['60', '65']);
+
+// A failure after the picker shows a message instead of spinning forever.
+rowAttachments = [att(70, 'Broken report.pdf')];
+const okFetch = w.fetch;
+w.fetch = async (url, opts) => String(url).includes('/download') ? { ok: false, status: 500, json: async () => ({ error: 'boom' }) } : route(url, opts);
+w.eval("openJob({rowId:9, sheetId:2, workOrderId:'W-1', zone:'X'})");
+await waitFor(() => $('modalOverlay').classList.contains('show'));
+click(d.querySelector('#modalList .pick-row'));
+await waitFor(() => !!d.querySelector('#frameList .empty') && !d.querySelector('#frameList .spinner'));
+check('a failed download says so instead of spinning', (d.querySelector('#frameList .empty') || {}).textContent, 'Couldn\'t load this job.Download failed: boom');
+w.fetch = okFetch;
+
 // Normal job. The real report names don't match CONFIG.DETAILER_NAME_RE, so
 // the operator picks it; the bay has accepted that.
 rowAttachments = [att(10, REPORT), att(11, DRAWINGS), att(12, 'IN PROGRESS: 90 - LB WALLS.pdf'), att(13, 'notes.dxf')];
@@ -259,6 +319,8 @@ w.eval("openJob({rowId:1, sheetId:2, workOrderId:'W-100', zone:'UNIT 5'})");
 await waitFor(() => $('modalOverlay').classList.contains('show'));
 check('picker lists only the original PDFs (no IN PROGRESS, no .dxf)',
   [...d.querySelectorAll('#modalList .pick-row .fname')].map(e => e.textContent.trim()), [REPORT, DRAWINGS]);
+check('cancelling the picker leaves a way back, not a spinner',
+  [!!d.querySelector('#frameList .spinner'), !!$('btnChooseFiles')], [false, true]);
 click(d.querySelectorAll('#modalList .pick-row')[0]);
 await waitFor(() => d.querySelectorAll('#frameList .frame-row').length === 3);
 const downloads = calls.filter(c => c.url.includes('/download')).map(c => new URL(c.url).searchParams.get('attachmentId'));
@@ -289,6 +351,21 @@ check('clearing search shows everything again', rows().length, 3);
 
 w.eval("AppState.issuesByFrame = { L501: [{ note: 'bent stud', created_at: '2026-09-01T00:00:00Z' }] }; renderFrameList();");
 check('a frame with a noted issue is flagged', d.querySelectorAll('#frameList .btn-note-issue.has-issue').length, 1);
+
+console.log('\nidentical frames');
+// A bridging report lists CA1007 eight times: each copy is ticked on its own.
+w.eval(`
+  const saved = AppState.frames;
+  AppState.frames = [1, 2, 3].map(n => ({ name:'CA1007', key:'CA1007 #' + n, copy:{ n:n, of:3 }, label:'CA1007', tags:[],
+    totalLength:'7.19 m', fasteners:'0', totalWeight:'9.8 kg', extraColumns:'', page:1, y:600 - n * 11, x:30 }));
+  AppState.doneSet = new Set(); renderFrameList();
+  window.__savedFrames = saved;
+`);
+click(rows()[1]);
+check('ticking one copy ticks only that copy', [...rows()].map(r => r.classList.contains('done')), [false, true, false]);
+check('each copy is labelled', [...rows()].map(r => r.querySelector('.copy-of').textContent), ['1 of 3', '2 of 3', '3 of 3']);
+check('stored under its own key', JSON.parse(w.localStorage.getItem('fc_job_1')).done, ['CA1007 #2']);
+w.eval("AppState.frames = window.__savedFrames; AppState.doneSet = new Set(['L500']); renderFrameList(); persistProgress();");
 
 /* -------------------------------------------------------- view drawing */
 console.log('\nview drawing (📄)');

@@ -384,6 +384,7 @@
   .tag-check{background:#3E8E6E;}
   .frame-row .name{display:flex;flex-wrap:wrap;align-items:center;gap:6px;}
   .frame-tag-chips{display:inline-flex;gap:4px;flex-wrap:wrap;}
+  .copy-of{font-size:12px;font-weight:600;color:var(--muted);margin-left:4px;}
   .frame-tag-chips .tag-chip{padding:2px 8px;font-size:10.5px;border-radius:6px;}
   .page-grid .tag-chips{display:flex;gap:3px;flex-wrap:wrap;justify-content:center;margin-top:2px;}
   .page-grid .tag-chip{padding:2px 6px;font-size:9.5px;border-radius:5px;}
@@ -609,7 +610,6 @@
    ========================================================================= */
 const CONFIG = {
   REPORT_ID: '7888733526249348',        // FRAMECAD - Work Orders Schedule
-  ALL_REPORT_ID: '672067532836740',     // FRAMECAD - Work Orders (every work order, any status)
   WORK_ORDER_SHEET_ID: '8417646009601924', // "Work Order" source sheet
   JOB_TYPE_FILTER: 'FRAMECAD',
   UPLOAD_CAP_BYTES: 30 * 1024 * 1024,
@@ -618,7 +618,11 @@ const CONFIG = {
   DETAILER_NAME_RE: /^\d{2,3}_.+\.pdf$/i,
   // Filenames matching this are treated as production drawings.
   DRAWINGS_NAME_RE: /(zone|panels|-\d{3,5}-|LGS)/i,
-  IN_PROGRESS_ATTACHMENT_RE: /^IN PROGRESS[: ]/i
+  IN_PROGRESS_ATTACHMENT_RE: /^IN PROGRESS[: ]/i,
+  // Never offered as a file to open: Smartsheet's own generated sheets (cover
+  // page, pack label, weld-label mapping) and, for now, pack lists (to be used
+  // later). Same generated names as the structural app's list.
+  EXCLUDED_ATTACHMENT_RE: /^(Cover Page|Pack Label|Mapping)|PACK[\s_\-]*LISTS?/i
 };
 
 /* =========================================================================
@@ -847,17 +851,40 @@ async function getReportData(reportId){
   return { columns: data.columns || [], rows };
 }
 
-// Every FRAMECAD work order in a report, any status. Which statuses show is
-// up to the job list (see JOB_LISTS).
-async function getWorkOrders(reportId){
-  const data = await getReportData(reportId || CONFIG.REPORT_ID);
-  // Map column titles -> virtualColumnId for this report.
+// The columns the job list reads, by title.
+const JOB_COLUMNS = ['Primary', 'Work Order Type', 'Project & Zone Number', 'Complete',
+  'Scheduled Start Date', 'Scheduled End Date', 'Work Record URL', 'F_Profile', 'Designer'];
+
+// Every row of a sheet, but only the job list's columns. The Work Order sheet
+// is ~2,000 rows by 148 columns; asking for just these (matched by title,
+// never by hardcoded column ID) keeps the download small.
+async function getSheetData(sheetId){
+  const cols = await ssGet('/sheets/' + sheetId + '/columns?includeAll=true');
+  const columns = (cols.data || []).filter(c => JOB_COLUMNS.includes(c.title));
+  const ids = columns.map(c => c.id).join(',');
+  const PAGE_SIZE = 500;
+  let rows = [];
+  for(let page = 1; page <= 50; page++){
+    const d = await ssGet('/sheets/' + sheetId + '?columnIds=' + ids + '&pageSize=' + PAGE_SIZE + '&page=' + page);
+    rows = rows.concat(d.rows || []);
+    if(!(d.rows || []).length || rows.length >= (d.totalRowCount || 0)) break;
+  }
+  return { columns, rows };
+}
+
+// Every FRAMECAD work order in a report (reportId) or sheet (sheetId), any
+// status. Which statuses show is up to the job list (see JOB_LISTS).
+async function getWorkOrders(reportId, sheetId){
+  // A report's cells point at columns by virtualColumnId; a sheet's by
+  // columnId. Rows from a sheet don't carry their sheetId, so add it.
+  const data = sheetId ? await getSheetData(sheetId) : await getReportData(reportId || CONFIG.REPORT_ID);
   const colByTitle = {};
-  data.columns.forEach(c => { colByTitle[c.title] = c.virtualId; });
+  data.columns.forEach(c => { colByTitle[c.title] = sheetId ? c.id : c.virtualId; });
+  const cellKey = sheetId ? 'columnId' : 'virtualColumnId';
 
   function cellFor(row, title){
     const vid = colByTitle[title];
-    return (row.cells || []).find(c => c.virtualColumnId === vid);
+    return (row.cells || []).find(c => c[cellKey] === vid);
   }
   // Per the methodology doc: read `value`, not `displayValue` — a picklist's
   // value is already the display string, but numbers/dates read raw in value.
@@ -878,7 +905,7 @@ async function getWorkOrders(reportId){
     const gaugeMatch = profile.match(/^(\d+)/);
     return {
       rowId: row.id,
-      sheetId: row.sheetId,
+      sheetId: row.sheetId || sheetId,
       workOrderId: cellValue(cellFor(row, 'Primary')) || '',
       workOrderType: cellValue(cellFor(row, 'Work Order Type')),
       zone: cellValue(cellFor(row, 'Project & Zone Number')) || '(no zone)',
@@ -891,8 +918,12 @@ async function getWorkOrders(reportId){
     };
   }).filter(j => (j.workOrderType || '').toUpperCase() === CONFIG.JOB_TYPE_FILTER);
 
-  // No client-side re-sort — this keeps whatever row order the report
-  // itself is configured with in Smartsheet.
+  // A report keeps the row order it's configured with in Smartsheet. A sheet
+  // has no useful order, so newest work order first (W-14152 before W-14146).
+  if(sheetId){
+    const num = j => parseInt(String(j.workOrderId).replace(/\D/g, ''), 10) || 0;
+    jobs.sort((a, b) => num(b) - num(a));
+  }
   return jobs;
 }
 
@@ -1089,6 +1120,20 @@ async function extractDetailerReport(pdfDoc){
     }
   }
 
+  // Identical frames can be listed more than once under one name (a
+  // bridging report lists CA1007 eight times). Ticks are stored by `key`, so
+  // each copy needs its own: "CA1007 #1" … "CA1007 #8". A name listed once
+  // keeps its plain name as the key, so ticks saved before this still apply.
+  const totals = {};
+  frames.forEach(f => { totals[f.name] = (totals[f.name] || 0) + 1; });
+  const seen = {};
+  frames.forEach(f => {
+    if(totals[f.name] === 1){ f.key = f.name; return; }
+    seen[f.name] = (seen[f.name] || 0) + 1;
+    f.key = f.name + ' #' + seen[f.name];
+    f.copy = { n: seen[f.name], of: totals[f.name] };
+  });
+
   return { header, frames };
 }
 
@@ -1200,7 +1245,7 @@ async function annotateDetailerPdf(originalBytes, frames, doneSet){
   const pages = pdfDoc.getPages();
 
   frames.forEach(f => {
-    if(!doneSet.has(f.name)) return;
+    if(!doneSet.has(f.key)) return;
     const page = pages[f.page - 1];
     if(!page) return;
     const { width, height } = page.getSize();
@@ -1235,7 +1280,7 @@ async function annotateDetailerPdf(originalBytes, frames, doneSet){
 const AppState = {
   jobs: [],              // the job list showing now, after its status filter
   jobList: 'scheduled',  // which button is selected (see JOB_LISTS)
-  reportJobs: {},        // report id -> every FRAMECAD job in it, fetched once
+  reportJobs: {},        // 'report:<id>' / 'sheet:<id>' -> every FRAMECAD job in it
   jobSearchTerm: '',
   currentJob: null,
   detailerBytes: null,
@@ -1334,14 +1379,15 @@ document.getElementById('btnChangeToken').addEventListener('click', () => {
 /* =========================================================================
    JOB LIST
    ========================================================================= */
-// The three job lists. "Not completed" and "Completed" share one report, so
-// switching between them doesn't fetch it again.
+// The three job lists. Scheduled reads the schedule report; "Not completed"
+// and "Completed" read the Work Order sheet itself (the bay's choice), and
+// share one download so switching between them doesn't fetch it again.
 const JOB_LISTS = {
-  scheduled: { report: CONFIG.REPORT_ID, keep: j => j.complete !== 'Complete',
+  scheduled: { source: 'report', id: CONFIG.REPORT_ID, keep: j => j.complete !== 'Complete',
                empty: 'No scheduled FRAMECAD jobs found.' },
-  open:      { report: CONFIG.ALL_REPORT_ID, keep: j => j.complete !== 'Complete',
+  open:      { source: 'sheet', id: CONFIG.WORK_ORDER_SHEET_ID, keep: j => j.complete !== 'Complete',
                empty: 'No open FRAMECAD work orders found.' },
-  completed: { report: CONFIG.ALL_REPORT_ID, keep: j => j.complete === 'Complete',
+  completed: { source: 'sheet', id: CONFIG.WORK_ORDER_SHEET_ID, keep: j => j.complete === 'Complete',
                empty: 'No completed FRAMECAD work orders found.' }
 };
 
@@ -1379,7 +1425,8 @@ async function loadJobs(force){
   const listName = AppState.jobList;
   const list = JOB_LISTS[listName];
   const container = document.getElementById('jobListContainer');
-  const cached = AppState.reportJobs[list.report];
+  const cacheKey = list.source + ':' + list.id;
+  const cached = AppState.reportJobs[cacheKey];
   if(cached && !force){
     AppState.jobs = cached.filter(list.keep);
     renderJobList();
@@ -1387,8 +1434,8 @@ async function loadJobs(force){
   }
   container.innerHTML = '<div class="spinner"></div>';
   try{
-    const jobs = await getWorkOrders(list.report);
-    AppState.reportJobs[list.report] = jobs;
+    const jobs = list.source === 'sheet' ? await getWorkOrders(null, list.id) : await getWorkOrders(list.id);
+    AppState.reportJobs[cacheKey] = jobs;
     // Tapped another list while this one loaded: that tap renders its own.
     if(AppState.jobList !== listName) return;
     AppState.jobs = jobs.filter(list.keep);
@@ -1473,7 +1520,8 @@ async function openJob(job){
     const attachments = await getRowAttachments(job.sheetId, job.rowId);
     const pdfAttachments = attachments.filter(a =>
       (a.name||'').toLowerCase().endsWith('.pdf') &&
-      !CONFIG.IN_PROGRESS_ATTACHMENT_RE.test(a.name||'')
+      !CONFIG.IN_PROGRESS_ATTACHMENT_RE.test(a.name||'') &&
+      !CONFIG.EXCLUDED_ATTACHMENT_RE.test(a.name||'')
     );
 
     let detailerAtt = pdfAttachments.find(a => CONFIG.DETAILER_NAME_RE.test(a.name));
@@ -1485,11 +1533,29 @@ async function openJob(job){
       return;
     }
 
-    await loadJobFiles(detailerAtt, drawingsAtt);
+    await openJobFiles(detailerAtt, drawingsAtt);
   }catch(e){
-    document.getElementById('frameList').innerHTML =
-      '<div class="empty">Couldn\'t load this job.<br>' + escapeHtml(e.message) + '</div>';
+    showJobError(e);
   }
+}
+
+function showJobError(e){
+  document.getElementById('frameList').innerHTML =
+    '<div class="empty">Couldn\'t load this job.<br>' + escapeHtml(e.message) + '</div>';
+}
+
+// Every way into loadJobFiles goes through here, so a failure always shows a
+// message instead of leaving the spinner running (the picker callbacks used
+// to swallow errors).
+async function openJobFiles(detailerAtt, drawingsAtt){
+  try{ await loadJobFiles(detailerAtt, drawingsAtt); }
+  catch(e){ showJobError(e); }
+}
+
+// Spinner with a line saying what's happening, so a slow step is visible.
+function showLoading(msg){
+  document.getElementById('frameList').innerHTML =
+    '<div class="spinner"></div><div class="empty" style="padding-top:0;">' + escapeHtml(msg) + '</div>';
 }
 
 // Picker entry for a job whose other PDFs aren't drawings (report only).
@@ -1502,16 +1568,22 @@ function pickAttachmentsManually(list, guessedDetailer, guessedDrawings){
     return;
   }
   checkForRevisions(AppState.currentJob, list);
+  // If the picker is cancelled, leave a way back to it rather than a spinner.
+  document.getElementById('frameList').innerHTML =
+    '<div class="empty">Choose the detailer report to open this job.<br><br>' +
+    '<button class="btn" id="btnChooseFiles" style="width:auto;">Choose files</button></div>';
+  document.getElementById('btnChooseFiles').addEventListener('click', () =>
+    pickAttachmentsManually(list, guessedDetailer, guessedDrawings));
   openModal('Which file is the detailer report?', list, async (detailerAtt) => {
     const rest = list.filter(a => a !== detailerAtt);
     if(!rest.length){
       // Report-only job: studs, bridging and other plain sticks.
-      await loadJobFiles(detailerAtt, null);
+      await openJobFiles(detailerAtt, null);
     } else if(rest.length === 1){
-      await loadJobFiles(detailerAtt, rest[0]);
+      await openJobFiles(detailerAtt, rest[0]);
     } else {
       openModal('Which file has the production drawings?', rest.concat([NO_DRAWINGS]), async (drawingsAtt) => {
-        await loadJobFiles(detailerAtt, drawingsAtt === NO_DRAWINGS ? null : drawingsAtt);
+        await openJobFiles(detailerAtt, drawingsAtt === NO_DRAWINGS ? null : drawingsAtt);
       });
     }
   }, guessedDetailer);
@@ -1640,7 +1712,7 @@ function askRevision(att, base, newer){
 }
 
 async function loadJobFiles(detailerAtt, drawingsAtt){
-  document.getElementById('frameList').innerHTML = '<div class="spinner"></div>';
+  showLoading(drawingsAtt ? 'Downloading the report and drawings\u2026' : 'Downloading the report\u2026');
   AppState.searchTerm = '';
   document.getElementById('searchInput').value = '';
   document.getElementById('btnClearSearch').style.display = 'none';
@@ -1663,6 +1735,7 @@ async function loadJobFiles(detailerAtt, drawingsAtt){
   AppState.detailerBytes = detailerBytes;
   AppState.drawingsBytes = drawingsBytes;
 
+  showLoading('Reading the report\u2026');
   const detailerPdf = await loadPdf(detailerBytes.slice(0));
   const { header, frames } = await extractDetailerReport(detailerPdf);
   AppState.header = header;
@@ -1670,7 +1743,7 @@ async function loadJobFiles(detailerAtt, drawingsAtt){
 
   const saved = Store.getJobState(AppState.currentJob.rowId);
   const savedNames = new Set(saved && saved.done ? saved.done : []);
-  AppState.doneSet = new Set(frames.map(f=>f.name).filter(n => savedNames.has(n)));
+  AppState.doneSet = new Set(frames.map(f=>f.key).filter(k => savedNames.has(k)));
 
   // Restore an in-progress (not yet saved) session if one was left running —
   // e.g. the tablet was closed or navigated away before Save Progress.
@@ -1740,7 +1813,7 @@ function renderFrameList(){
   }
 
   visible.forEach(f => {
-    const done = AppState.doneSet.has(f.name);
+    const done = AppState.doneSet.has(f.key);
     const issues = AppState.issuesByFrame[f.name] || [];
     const row = document.createElement('div');
     row.className = 'frame-row' + (done ? ' done' : '');
@@ -1751,7 +1824,8 @@ function renderFrameList(){
     row.innerHTML =
       '<div class="check">' + (done ? '&#10003;' : '') + '</div>' +
       '<div class="info">' +
-        '<div class="name">' + escapeHtml(f.label || f.name) + tagChips + '</div>' +
+        '<div class="name">' + escapeHtml(f.label || f.name) +
+          (f.copy ? ' <span class="copy-of">' + f.copy.n + ' of ' + f.copy.of + '</span>' : '') + tagChips + '</div>' +
         '<div class="specs">' + escapeHtml(f.totalLength) + ' &middot; ' +
           escapeHtml(f.fasteners) + ' fasteners &middot; ' + escapeHtml(f.totalWeight) +
           (f.extraColumns ? '<br><span class="extra-cols">' + escapeHtml(f.extraColumns) + '</span>' : '') +
@@ -1776,8 +1850,8 @@ function renderFrameList(){
 
     row.addEventListener('click', () => {
       if(navigator.vibrate) navigator.vibrate(10);
-      if(AppState.doneSet.has(f.name)) AppState.doneSet.delete(f.name);
-      else AppState.doneSet.add(f.name);
+      if(AppState.doneSet.has(f.key)) AppState.doneSet.delete(f.key);
+      else AppState.doneSet.add(f.key);
       persistProgress();
       renderFrameList();
     });
@@ -2048,9 +2122,9 @@ document.getElementById('btnSaveProgress').addEventListener('click', async () =>
     // A session only counts once it's saved — Start Job alone logs nothing.
     if(AppState.sessionStartTime){
       const sessionFrames = AppState.frames.filter(f =>
-        AppState.doneSet.has(f.name) && !AppState.sessionStartDoneSet.has(f.name));
+        AppState.doneSet.has(f.key) && !AppState.sessionStartDoneSet.has(f.key));
       const sessionMetres = sessionFrames.reduce((sum, f) => sum + parseMetres(f.totalLength), 0);
-      const allDoneFrames = AppState.frames.filter(f => AppState.doneSet.has(f.name));
+      const allDoneFrames = AppState.frames.filter(f => AppState.doneSet.has(f.key));
       const totalMetres = allDoneFrames.reduce((sum, f) => sum + parseMetres(f.totalLength), 0);
 
       try{
@@ -2059,7 +2133,7 @@ document.getElementById('btnSaveProgress').addEventListener('click', async () =>
           zone: AppState.currentJob.zone,
           session_start: AppState.sessionStartTime,
           saved_at: new Date().toISOString(),
-          frames_completed_this_session: sessionFrames.map(f => f.name),
+          frames_completed_this_session: sessionFrames.map(f => f.key),
           frames_completed_count: sessionFrames.length,
           linear_metres_this_session: Math.round(sessionMetres * 100) / 100,
           total_frames_done: AppState.doneSet.size,

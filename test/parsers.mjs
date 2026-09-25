@@ -122,9 +122,12 @@ async function checkReport(file){
     fail('report says ' + header.frameCount + ' frames, the app lists ' + frames.length +
          ' (the rest can\'t be ticked off)');
   } else console.log('  ' + frames.length + ' of ' + header.frameCount + ' frames');
-  const names = frames.map(f => f.name);
-  const dupes = names.filter((n, i) => names.indexOf(n) !== i);
-  if(dupes.length) fail('duplicate frame names, ticking one ticks both: ' + list([...new Set(dupes)]));
+  // Identical frames may share a name (a bridging report lists CA1007 eight
+  // times), but each needs its own key or ticking one ticks them all.
+  const keys = frames.map(f => f.key);
+  const dupes = keys.filter((k, i) => keys.indexOf(k) !== i);
+  if(dupes.length) fail('duplicate frame keys, ticking one ticks both: ' + list([...new Set(dupes)]));
+  if(keys.some(k => !k)) fail('a frame has no key');
 
   if(wantAnnotate && frames.length){
     const done = new Set(frames.filter((f, i) => i % 2 === 0).map(f => f.name));

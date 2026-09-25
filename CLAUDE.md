@@ -68,16 +68,25 @@ look there first for the fix.
   Work Order Type is `FRAMECAD`:
   - **Scheduled** (default): `FRAMECAD - Work Orders Schedule`, ID
     `7888733526249348` (`CONFIG.REPORT_ID`), minus rows marked Complete.
-  - **Not completed** / **Completed**: `FRAMECAD - Work Orders`, ID
-    `672067532836740` (`CONFIG.ALL_REPORT_ID`), every work order (892 rows in
-    Sept 2026), split on Complete. Fetched once for both buttons.
-  Reports come a page at a time; `getReportData` keeps fetching until
-  `totalRowCount`. Job search matches work order number and zone/project only
+  - **Not completed** / **Completed**: the **Work Order sheet itself**
+    (`CONFIG.WORK_ORDER_SHEET_ID`), split on Complete, newest work order
+    first. The bay asked for the sheet, not the `FRAMECAD - Work Orders`
+    report. The sheet is ~2,000 rows by 148 columns, so `getSheetData` looks
+    the needed columns up by title (`JOB_COLUMNS`) and downloads only those.
+    Fetched once for both buttons. Jobs moved to the Work Order Archive sheet
+    don't show.
+  Reports and sheets come a page at a time; both fetchers keep going until
+  `totalRowCount`. A sheet's cells use `columnId`, a report's
+  `virtualColumnId`, and sheet rows don't carry `sheetId`. Job search matches work order number and zone/project only
   (the bay's choice), every word in any order.
 - Columns read, by title: Primary, Work Order Type, Project & Zone Number,
   Complete, Scheduled Start Date, Scheduled End Date, Work Record URL,
   F_Profile (the leading number is shown as the gauge chip), Designer.
-- Attachments: PDFs only, minus the app's own `IN PROGRESS:` uploads. The
+- Attachments: PDFs only, minus the app's own `IN PROGRESS:` uploads and
+  `CONFIG.EXCLUDED_ATTACHMENT_RE`: Smartsheet's generated `Cover Page…`,
+  `Pack Label…` and `Mapping for Work Order Weld Label.pdf`, which must
+  **never** be offered, and pack lists (to be used later). With those gone a
+  typical row is just report + drawings, or the report alone. The
   report is recognised by `CONFIG.DETAILER_NAME_RE` and the drawings by
   `CONFIG.DRAWINGS_NAME_RE`; when either is missing the operator picks from a
   list. Real report names (`26040-LGS-3-600 [1] UNIT 5 - Detailer - Report -
@@ -126,6 +135,10 @@ Facts from the bay, not visible in the code:
   job (report only)".
 - Pack lists (e.g. `24477-LGS-C1-621 … Pack lists`) will be used later; the
   app ignores them for now.
+- **Identical frames can share a name.** A bridging report (W-13859, `89 - LS
+  BRIDGING - Report.pdf`) lists `CA1007` eight times. Ticks are stored by
+  `f.key`, not `f.name`: a name listed once is its own key, repeats become
+  `CA1007 #1` … `#8` and show "1 of 8". Issue notes stay keyed by name.
 
 ## PDF parsing
 
@@ -198,8 +211,8 @@ deliberate change to the test.
   that as long as they can be viewed: the pages show as "Pg N" and their
   frames get no 📄. The tests report this as expected. The structural app
   shows a hint on such pages; not ported (the bay didn't ask for it).
-- When a row has the report plus exactly one other PDF, that PDF is taken as
-  the drawings without asking, even if it's, say, a pack list.
+- When a row has the report plus exactly one other PDF (after the exclusions
+  above), that PDF is taken as the drawings without asking.
 - Nested labels like `GI100-2 (GI100-1 (WELD))` wouldn't match `rowRe`; no
   sample has one yet.
 - Uploads show as authored by whoever owns the Worker's token, not the operator.
