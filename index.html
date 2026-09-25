@@ -867,6 +867,64 @@ async function resolveLiveAttachment(sheetId, rowId, name){
   return matches[matches.length - 1];
 }
 
+// Every version of one attachment, each with its own id, createdAt and
+// createdBy. Any version's id works here. Goes through the Worker's plain
+// /api passthrough, so the Worker needs no route of its own for it.
+async function getAttachmentVersions(sheetId, attachmentId){
+  const data = await ssGet('/sheets/' + sheetId + '/attachments/' + attachmentId + '/versions?includeAll=true');
+  return data.data || [];
+}
+
+// ---- Versions ---------------------------------------------------------------
+// Ported from Structural-Checklist PR #2. Save Progress uploads the marked-up
+// report as a new version of the original detailer report. The app must then
+// never work from its own markup: the next save would draw new marks on top
+// of old ones, so a frame unticked since would stay marked OK. (Parsing a
+// markup happens to still list every frame, as the OK stamps sit on their own
+// text line; test/parsers.mjs checks that, but don't rely on it.) So the app
+// always works from a clean report version.
+//
+// App saves always come from the Worker's Smartsheet account; designers upload
+// revisions from their own logins. That's how the two are told apart. Each
+// markup also carries PDF keywords naming the clean version it was drawn from
+// (and any newer revision the bay chose not to switch to). The tag is this
+// app's own, distinct from the structural app's "austruss-ssc-markup".
+const MARKUP_TAG = 'austruss-fc-markup';
+function markupKeywords(note){
+  note = note || {};
+  return [MARKUP_TAG]
+    .concat(note.sourceId ? ['fc-source:' + note.sourceId] : [])
+    .concat(note.skipId ? ['fc-skip:' + note.skipId] : []);
+}
+function parseMarkupKeywords(keywords){
+  const s = String(keywords || '');
+  if(s.indexOf(MARKUP_TAG) === -1) return null;
+  const src = s.match(/fc-source:(\d+)/), skip = s.match(/fc-skip:(\d+)/);
+  return { sourceId: src ? src[1] : null, skipId: skip ? skip[1] : null };
+}
+
+// versions: [{id, createdAt, createdBy:{email,name}}] in any order.
+// note: parsed keywords from the newest app save, or null.
+// Returns the clean version to work from (base), the newest designer revision
+// uploaded after it that hasn't been declined (newer), and whether the latest
+// version is a designer upload made since the last save.
+function pickWorkingVersion(versions, appEmail, note){
+  const byNewest = versions.slice().sort((a,b) => (b.createdAt||'').localeCompare(a.createdAt||''));
+  const email = (appEmail || '').toLowerCase();
+  const isApp = v => !!email && ((v.createdBy && v.createdBy.email) || '').toLowerCase() === email;
+  const clean = byNewest.filter(v => !isApp(v));
+  const lastApp = byNewest.find(isApp) || null;
+  const byId = id => id ? clean.find(v => String(v.id) === String(id)) || null : null;
+  note = note || {};
+  let base = byId(note.sourceId);
+  // No save yet, or its note is missing: the last save must have been drawn
+  // from the newest clean version uploaded before it.
+  if(!base) base = (lastApp && clean.find(v => (v.createdAt||'') <= (lastApp.createdAt||''))) || clean[0] || byNewest[0] || null;
+  const floor = [base, byId(note.skipId)].filter(Boolean).map(v => v.createdAt || '').sort().pop() || '';
+  const newer = clean.find(v => (v.createdAt||'') > floor) || null;
+  return { base, newer, lastApp, revisedSinceSave: !!(lastApp && byNewest[0] && !isApp(byNewest[0])) };
+}
+
 /* =========================================================================
    PDF PARSING (pdf.js)
    ========================================================================= */
@@ -1127,8 +1185,21 @@ const AppState = {
   sessionStartTime: null,      // ISO string, null when no session is active
   sessionStartDoneSet: new Set(), // snapshot of doneSet at Start Job time
   issuesByFrame: {}, // frame name -> array of {note, created_at}
-  candidateAttachments: []
+  candidateAttachments: [],
+  detailerAtt: null,     // the original report attachment Save Progress versions
+  detailerSource: null,  // { sourceId, skipId }: clean report version worked from
+  appEmail: null         // the Worker's Smartsheet account, fetched once
 };
+
+// Whose name the Worker's token uploads under: every version by this account
+// is one of the app's own marked-up saves.
+async function getAppAccountEmail(){
+  if(AppState.appEmail == null){
+    const me = await ssGet('/users/me');
+    AppState.appEmail = me.email || '';
+  }
+  return AppState.appEmail;
+}
 
 /* =========================================================================
    NAVIGATION
@@ -1299,6 +1370,7 @@ function pickAttachmentsManually(list, guessedDetailer, guessedDrawings){
       '<div class="empty">No PDF attachments found on this row yet.</div>';
     return;
   }
+  checkForRevisions(AppState.currentJob, list);
   openModal('Which file is the detailer report?', list, async (detailerAtt) => {
     const rest = list.filter(a => a !== detailerAtt);
     if(rest.length === 1){
@@ -1320,8 +1392,10 @@ function openModal(title, list, cb, highlighted){
   list.forEach(att => {
     const row = document.createElement('div');
     row.className = 'pick-row';
+    row.dataset.attId = att.id;
     row.innerHTML = '<div class="fname">' + escapeHtml(att.name) +
-      (att === highlighted ? '  <span style="color:var(--orange);">(likely)</span>' : '') + '</div>' +
+      (att === highlighted ? '  <span style="color:var(--orange);">(likely)</span>' : '') +
+      (att.revised ? revisionChip() : '') + '</div>' +
       '<div class="fdate">Uploaded ' + escapeHtml(att.createdAt || '') + '</div>';
     row.addEventListener('click', () => { closeModal(); cb(att); });
     listEl.appendChild(row);
@@ -1332,13 +1406,116 @@ function closeModal(){
   document.getElementById('modalOverlay').classList.remove('show');
 }
 
+function revisionChip(){
+  return '<span class="frame-tag-chips"><span class="tag-chip tag-girder">NEW REVISION</span></span>';
+}
+
+// Flags files a designer has uploaded a new version of since the last Save
+// Progress. Runs in the background while the picker shows; a failure just
+// means no badge, and the choice is still offered when the report is opened.
+async function checkForRevisions(job, list){
+  let email;
+  try{ email = await getAppAccountEmail(); }catch(e){ return; }
+  for(const att of list){
+    try{
+      const versions = await getAttachmentVersions(job.sheetId, att.id);
+      if(AppState.currentJob !== job) return;
+      att.revised = pickWorkingVersion(versions, email, null).revisedSinceSave;
+      // Badge the row in place if the picker is still showing it.
+      const row = document.querySelector('#modalList .pick-row[data-att-id="' + att.id + '"] .fname');
+      if(att.revised && row && !row.querySelector('.tag-chip')) row.insertAdjacentHTML('beforeend', revisionChip());
+    }catch(e){ /* no badge for this file */ }
+  }
+}
+
+// The latest version of the report may be one of our own marked-up saves, so
+// go back to the clean report it was drawn from (see pickWorkingVersion). If
+// a designer has uploaded a newer revision since, the operator chooses which
+// to work from. Ticks are kept by frame name, so they carry over either way.
+async function loadWorkingDetailer(att){
+  const job = AppState.currentJob;
+  let versions = [], email = '';
+  try{
+    [versions, email] = await Promise.all([getAttachmentVersions(job.sheetId, att.id), getAppAccountEmail()]);
+  }catch(e){
+    toast('Couldn’t read the report’s version history — showing the latest version', 'err');
+  }
+  let pick = versions.length && email ? pickWorkingVersion(versions, email, null) : null;
+  if(!pick || !pick.base){
+    const safe = await cleanOf(await downloadAttachmentBytes(job.sheetId, att.id), att.id);
+    AppState.detailerSource = safe.note;
+    return safe.bytes;
+  }
+  let note = null;
+  if(pick.lastApp){
+    try{
+      note = await readMarkupNote(await downloadAttachmentBytes(job.sheetId, pick.lastApp.id));
+      pick = pickWorkingVersion(versions, email, note);
+    }catch(e){ /* fall back to the newest clean version before the last save */ }
+  }
+  let skipId = note ? note.skipId : null;
+  if(pick.newer){
+    if(await askRevision(att, pick.base, pick.newer) === 'switch'){ pick.base = pick.newer; skipId = null; }
+    else skipId = pick.newer.id;
+  }
+  AppState.detailerSource = { sourceId: pick.base.id, skipId };
+  return (await cleanOf(await downloadAttachmentBytes(job.sheetId, pick.base.id), pick.base.id)).bytes;
+}
+
+// Safety net: if the version about to be worked from is itself one of our
+// markups (history unreadable, or a version missing its createdBy), follow its
+// note back to the clean report rather than parse our own stamps.
+async function cleanOf(bytes, id){
+  const note = await readMarkupNote(bytes.slice(0)).catch(() => null);
+  if(!note || !note.sourceId || String(note.sourceId) === String(id)) return { bytes, note: null };
+  return { bytes: await downloadAttachmentBytes(AppState.currentJob.sheetId, note.sourceId), note };
+}
+
+async function readMarkupNote(bytes){
+  const pdf = await loadPdf(bytes);
+  const meta = await pdf.getMetadata().catch(() => null);
+  return parseMarkupKeywords(meta && meta.info && meta.info.Keywords);
+}
+
+// Resolves 'keep' or 'switch'. Cancel counts as keep, so nothing changes
+// unless someone deliberately picks the new revision.
+function askRevision(att, base, newer){
+  return new Promise(resolve => {
+    const who = v => (v.createdBy && (v.createdBy.name || v.createdBy.email)) || 'unknown';
+    document.getElementById('modalTitle').textContent = 'New revision: ' + att.name.replace(/\.pdf$/i, '');
+    document.getElementById('modalSearchInput').style.display = 'none';
+    const listEl = document.getElementById('modalList');
+    listEl.className = '';
+    listEl.innerHTML = '<div class="fdate" style="margin-bottom:12px;">A newer version of this report has been uploaded. ' +
+      'Ticks stay either way; if you switch, check them against the new report.</div>';
+    const cancelBtn = document.querySelector('#modalSheet > .btn.outline');
+    const onCancel = () => resolve('keep');   // its own onclick closes the modal
+    const choose = choice => { cancelBtn.removeEventListener('click', onCancel); closeModal(); resolve(choice); };
+    [['keep', 'Keep working on the version you started', base],
+     ['switch', 'Switch to the new revision', newer]].forEach(([choice, label, v]) => {
+      const row = document.createElement('div');
+      row.className = 'pick-row';
+      row.innerHTML = '<div class="fname">' + escapeHtml(label) + '</div>' +
+        '<div class="fdate">Uploaded by ' + escapeHtml(who(v)) + ', ' + escapeHtml(formatDateTime(v.createdAt)) + '</div>';
+      row.addEventListener('click', () => choose(choice));
+      listEl.appendChild(row);
+    });
+    cancelBtn.addEventListener('click', onCancel, { once: true });
+    document.getElementById('modalOverlay').classList.add('show');
+  });
+}
+
 async function loadJobFiles(detailerAtt, drawingsAtt){
   document.getElementById('frameList').innerHTML = '<div class="spinner"></div>';
   AppState.searchTerm = '';
   document.getElementById('searchInput').value = '';
   document.getElementById('btnClearSearch').style.display = 'none';
+  // The report comes from its clean version, never from one of our own
+  // marked-up saves. Drawings are never written by the app: latest is fine.
+  AppState.detailerAtt = detailerAtt;
+  AppState.detailerSource = null;
   const [detailerBytes, drawingsBytes] = await Promise.all([
-    downloadAttachmentBytes(AppState.currentJob.sheetId, detailerAtt.id),
+    loadWorkingDetailer(detailerAtt),
     downloadAttachmentBytes(AppState.currentJob.sheetId, drawingsAtt.id)
   ]);
   AppState.detailerBytes = detailerBytes;
@@ -1678,32 +1855,37 @@ function renderSessionList(sessions){
 }
 
 /* =========================================================================
-   SAVE PROGRESS — annotate, then upload as a new version of the same
-   "IN PROGRESS" attachment (never a fresh duplicate each time).
+   SAVE PROGRESS — annotate the clean report, then upload it as a new version
+   of the original detailer report attachment, same name. (It used to upload a
+   separate "IN PROGRESS: <num> - <NAME>.pdf"; those older uploads stay hidden
+   by IN_PROGRESS_ATTACHMENT_RE.) The markup is keyworded with the clean
+   version it was drawn from so the next open can find its way back to it.
    ========================================================================= */
+async function tagMarkup(bytes, source){
+  const doc = await PDFLib.PDFDocument.load(bytes);
+  doc.setKeywords(markupKeywords(source));
+  return await doc.save();
+}
+
 document.getElementById('btnSaveProgress').addEventListener('click', async () => {
-  if(!AppState.currentJob || !AppState.detailerBytes){ return; }
+  if(!AppState.currentJob || !AppState.detailerBytes || !AppState.detailerAtt){ return; }
   const btn = document.getElementById('btnSaveProgress');
   btn.disabled = true;
   btn.textContent = 'Saving…';
   try{
+    // Always drawn from the clean report (detailerBytes), never from an
+    // earlier markup, so each version shows only the current ticks.
     const annotated = await annotateDetailerPdf(AppState.detailerBytes.slice(0), AppState.frames, AppState.doneSet);
-    const num = (AppState.header.sectionTitle || '').split('_')[0] || '';
-    const namePart = (AppState.header.sectionTitle || 'Report').split('_').slice(1).join(' ') || AppState.header.sectionTitle || 'Report';
-    const filename = 'IN PROGRESS: ' + num + ' - ' + namePart.toUpperCase() + '.pdf';
+    const tagged = await tagMarkup(annotated, AppState.detailerSource);
+    const filename = AppState.detailerAtt.name;
 
     // Re-resolve immediately before writing — never trust a cached attachment ID.
-    const existing = await resolveLiveAttachment(AppState.currentJob.sheetId, AppState.currentJob.rowId, filename);
+    const live = await resolveLiveAttachment(AppState.currentJob.sheetId, AppState.currentJob.rowId, filename);
+    if(!live) throw new Error('the report is no longer attached to this row');
+    await uploadAttachmentBytes(AppState.currentJob.sheetId,
+      { attachmentId: live.id, filename, mode: 'version' }, tagged);
 
-    if(existing){
-      await uploadAttachmentBytes(AppState.currentJob.sheetId,
-        { attachmentId: existing.id, filename, mode: 'version' }, annotated);
-    } else {
-      await uploadAttachmentBytes(AppState.currentJob.sheetId,
-        { rowId: AppState.currentJob.rowId, filename, mode: 'new' }, annotated);
-    }
-
-    let msg = 'Uploaded "' + filename + '" to Smartsheet';
+    let msg = 'Saved to Smartsheet as a new version of the report';
 
     // A session only counts once it's saved — Start Job alone logs nothing.
     if(AppState.sessionStartTime){
