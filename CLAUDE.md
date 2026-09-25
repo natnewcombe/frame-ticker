@@ -64,20 +64,29 @@ look there first for the fix.
 ## Smartsheet specifics
 
 - The job list has three buttons (`JOB_LISTS`), all over the Work Order sheet
-  `8417646009601924`, jobs in the report's own row order, only rows whose
-  Work Order Type is `FRAMECAD`:
+  `8417646009601924`, only rows whose Work Order Type is `FRAMECAD`:
   - **Scheduled** (default): `FRAMECAD - Work Orders Schedule`, ID
-    `7888733526249348` (`CONFIG.REPORT_ID`), minus rows marked Complete.
-  - **Not completed** / **Completed**: `FRAMECAD - Work Orders`, ID
-    `672067532836740` (`CONFIG.ALL_REPORT_ID`), every work order (892 rows in
-    Sept 2026), split on Complete. Fetched once for both buttons.
-  Reports come a page at a time; `getReportData` keeps fetching until
-  `totalRowCount`. Job search matches work order number and zone/project only
+    `7888733526249348` (`CONFIG.REPORT_ID`), minus rows marked Complete, in
+    the report's own row order.
+  - **Not completed** / **Completed**: the **Work Order sheet itself**
+    (`CONFIG.WORK_ORDER_SHEET_ID`), split on Complete, newest work order
+    first. The bay asked for the sheet, not the `FRAMECAD - Work Orders`
+    report. The sheet is ~2,000 rows by 148 columns, so `getSheetData` looks
+    the needed columns up by title (`JOB_COLUMNS`) and downloads only those.
+    Fetched once for both buttons. Jobs moved to the Work Order Archive sheet
+    don't show.
+  Reports and sheets come a page at a time; both fetchers keep going until
+  `totalRowCount`. A sheet's cells use `columnId`, a report's
+  `virtualColumnId`, and sheet rows don't carry `sheetId`. Job search matches work order number and zone/project only
   (the bay's choice), every word in any order.
 - Columns read, by title: Primary, Work Order Type, Project & Zone Number,
   Complete, Scheduled Start Date, Scheduled End Date, Work Record URL,
   F_Profile (the leading number is shown as the gauge chip), Designer.
-- Attachments: PDFs only, minus the app's own `IN PROGRESS:` uploads. The
+- Attachments: PDFs only, minus the app's own `IN PROGRESS:` uploads and
+  `CONFIG.EXCLUDED_ATTACHMENT_RE`: Smartsheet's generated `Cover Page…`,
+  `Pack Label…` and `Mapping for Work Order Weld Label.pdf`, which must
+  **never** be offered, and pack lists (to be used later). With those gone a
+  typical row is just report + drawings, or the report alone. The
   report is recognised by `CONFIG.DETAILER_NAME_RE` and the drawings by
   `CONFIG.DRAWINGS_NAME_RE`; when either is missing the operator picks from a
   list. Real report names (`26040-LGS-3-600 [1] UNIT 5 - Detailer - Report -
@@ -117,9 +126,19 @@ Facts from the bay, not visible in the code:
   `GI100-2 (GI100-1 (WELD))` are the same idea.
 - **Split frames:** `N504.A` / `N504.B` (26018) and `NB2047-A` / `-B` / `-C`
   (24477) are parts of one frame, all built from the one drawing (`N504`,
-  `NB2047`).
+  `NB2047`). Both can combine: `HN146-1-C` (Zone 16 trusses) is drawing
+  `HN146`. `findDrawingPage` does this matching (exact match first, then
+  everything from the first `-` or `.` dropped); 📄 only shows on frames it
+  finds a page for.
+- **Report-only jobs** open with no drawings: the Drawings tab is hidden, and
+  when the row has other PDFs the drawings picker offers "No drawings for this
+  job (report only)".
 - Pack lists (e.g. `24477-LGS-C1-621 … Pack lists`) will be used later; the
   app ignores them for now.
+- **Identical frames can share a name.** A bridging report (W-13859, `89 - LS
+  BRIDGING - Report.pdf`) lists `CA1007` eight times. Ticks are stored by
+  `f.key`, not `f.name`: a name listed once is its own key, repeats become
+  `CA1007 #1` … `#8` and show "1 of 8". Issue notes stay keyed by name.
 
 ## PDF parsing
 
@@ -178,7 +197,7 @@ ones. So opening a job always goes back to a clean report version
 - A designer version newer than the last save gets a NEW REVISION badge in the
   "Which file is the detailer report?" picker, and opening the report asks:
   keep working on the version you started, or switch. Ticks are kept by frame
-  name, so they carry over either way.
+  key (see identical frames above), so they carry over either way.
 - Drawings are never written by the app, so they always open at their latest
   version.
 
@@ -187,15 +206,15 @@ ones. So opening a job always goes back to a clean report version
 Measured by the tests against `samples/`; each is pinned so a fix is a
 deliberate change to the test.
 
-- **📄 can't find the drawing** for copies (`N101-1` vs drawing `N101`, all 163
-  truss frames in Zone 16) and parts (`NB2047-A`, 19 frames in 24477). The
-  match in `jumpToFrameDrawing` is exact.
-- **📄 shows on every frame**, even when there's nothing to go to.
-- **A report-only job can't open.** After picking the report, the app asks for
-  drawings from an empty list.
 - **Drawings with no text layer** (`150 Bulkhead Frames Z1 - Production
-  Drawing.pdf`, flattened) can't be identified by any rule. The structural app
-  shows a hint on such pages; not ported yet.
+  Drawing.pdf`, flattened) can't be identified by any rule. The bay accepts
+  that as long as they can be viewed: the pages show as "Pg N" and their
+  frames get no 📄. The tests report this as expected. The structural app
+  shows a hint on such pages; not ported (the bay didn't ask for it).
+- When a row has the report plus exactly one other PDF (after the exclusions
+  above), that PDF is taken as the drawings without asking.
+- Nested labels like `GI100-2 (GI100-1 (WELD))` wouldn't match `rowRe`; no
+  sample has one yet.
 - Uploads show as authored by whoever owns the Worker's token, not the operator.
 - If whoever owns the Worker's Smartsheet token also uploads reports from that
   same login, the app will take those uploads for its own saves and skip them

@@ -56,7 +56,9 @@ const SAMPLES = [
     drawings: '26040-LGS-3-201 [3] UNIT 5 - Walls - 90mm - LB.pdf' },
   { report: 'Report_75_Trusses_Zone 16.pdf',
     drawings: '26110-LGS-16-220 [C] ZONE 16 - Trusses.pdf' },
-  { report: '90mm STUDS REPORT.pdf', drawings: null }
+  { report: '90mm STUDS REPORT.pdf', drawings: null },
+  // W-13859 Calderwood: CA1007 listed 8 times, each ticked separately.
+  { report: '89 - LS BRIDGING - Report.pdf', drawings: null }
 ];
 // Kept in samples/ for later work, but the app doesn't open them yet.
 const IGNORED = {
@@ -92,7 +94,8 @@ function loadParsers(){
   };
   const fn = new Function(...Object.keys(ctx), code + `
     return { CONFIG, loadPdf, extractDetailerReport, buildDrawingIndex,
-             annotateDetailerPdf, extractTags, markupKeywords, parseMarkupKeywords };`);
+             annotateDetailerPdf, extractTags, markupKeywords, parseMarkupKeywords,
+             findDrawingPage };`);
   return fn(...Object.values(ctx));
 }
 
@@ -121,9 +124,12 @@ async function checkReport(file){
     fail('report says ' + header.frameCount + ' frames, the app lists ' + frames.length +
          ' (the rest can\'t be ticked off)');
   } else console.log('  ' + frames.length + ' of ' + header.frameCount + ' frames');
-  const names = frames.map(f => f.name);
-  const dupes = names.filter((n, i) => names.indexOf(n) !== i);
-  if(dupes.length) fail('duplicate frame names, ticking one ticks both: ' + list([...new Set(dupes)]));
+  // Identical frames may share a name (a bridging report lists CA1007 eight
+  // times), but each needs its own key or ticking one ticks them all.
+  const keys = frames.map(f => f.key);
+  const dupes = keys.filter((k, i) => keys.indexOf(k) !== i);
+  if(dupes.length) fail('duplicate frame keys, ticking one ticks both: ' + list([...new Set(dupes)]));
+  if(keys.some(k => !k)) fail('a frame has no key');
 
   if(wantAnnotate && frames.length){
     const done = new Set(frames.filter((f, i) => i % 2 === 0).map(f => f.name));
@@ -141,34 +147,34 @@ async function checkDrawings(file){
   console.table(pages.map(p => ({ page: p.page, drawing: p.drawingNumber, tags: p.tags.join(', ') })));
   const unidentified = pages.filter(p => !p.drawingNumber).map(p => p.page);
   console.log('  ' + (pages.length - unidentified.length) + ' of ' + pages.length + ' pages identified');
-  if(unidentified.length){
-    // Say whether the page has any text at all: a flattened or scanned page
-    // can't be read by any rule, which is a different problem from a layout
-    // the rules don't know yet.
-    const noText = [];
-    for(const n of unidentified){
-      const c = await (await pdf.getPage(n)).getTextContent();
-      if(!c.items.some(i => i.str.trim())) noText.push(n);
-    }
-    fail(unidentified.length + ' page(s) with no drawing number: ' + list(unidentified) +
-         (noText.length === unidentified.length ? ' (no text layer at all: flattened or scanned)'
-          : noText.length ? ' (' + noText.length + ' of them have no text layer)' : ''));
+  // A page with no text at all (flattened or scanned) can't be read by any
+  // rule. The bay is fine with that as long as it can be viewed: it's shown
+  // as "Pg N" and its frames get no 📄 button. Only pages that DO have text
+  // but no drawing number are a problem (a layout the rules don't know yet).
+  const noText = [];
+  for(const n of unidentified){
+    const c = await (await pdf.getPage(n)).getTextContent();
+    if(!c.items.some(i => i.str.trim())) noText.push(n);
   }
+  const unknown = unidentified.filter(n => !noText.includes(n));
+  if(noText.length) console.log('  ' + noText.length + ' page(s) with no text layer (expected: viewable, no 📄): ' + list(noText));
+  if(unknown.length) fail(unknown.length + ' page(s) with text but no drawing number: ' + list(unknown));
+  pages.noTextPages = noText.length;
   const nums = pages.map(p => p.drawingNumber).filter(Boolean);
   const dupes = nums.filter((n, i) => nums.indexOf(n) !== i);
   if(dupes.length) console.log('  note: drawing number on more than one page: ' + list([...new Set(dupes)]));
   return pages;
 }
 
-// Can the 📄 button on each frame find its drawing? This mirrors the match in
-// jumpToFrameDrawing (exact, upper-cased). That function lives below the APP
-// STATE banner, so it can't be called from here; if the match moves into a
-// helper above the banner, call that helper here instead.
+// Can the 📄 button on each frame find its drawing? Uses the app's own
+// findDrawingPage, the same match the button uses. When the whole drawings
+// file has no text, no frame can find a page; that's expected (see above).
 function checkPair(frames, pages){
-  const nums = new Set(pages.map(p => p.drawingNumber).filter(Boolean));
-  const missing = frames.filter(f => !nums.has(f.name.toUpperCase())).map(f => f.name);
+  const missing = frames.filter(f => !api.findDrawingPage(pages, f.name)).map(f => f.name);
   console.log('  view drawing: ' + (frames.length - missing.length) + ' of ' + frames.length + ' frames find their page');
-  if(missing.length) fail(missing.length + ' frame(s) whose 📄 button finds no drawing: ' + list(missing));
+  if(!missing.length) return;
+  if(pages.noTextPages === pages.length) console.log('  (expected: the drawings have no text, so these frames get no 📄 button)');
+  else fail(missing.length + ' frame(s) whose 📄 button finds no drawing: ' + list(missing));
 }
 
 /* -------------------------------------------------------------------- main */
@@ -214,7 +220,7 @@ Object.entries(IGNORED).forEach(([f, why]) => {
 // that a markup still parses to every frame, as a second line of defence if
 // the app ever did read one (its marks would still stack on the next save).
 if(!filter){
-  const f = SAMPLES[SAMPLES.length - 1].report;
+  const f = '90mm STUDS REPORT.pdf';
   console.log('\n=== markup note round-trip  [' + f + ']');
   try{
     const { frames } = await api.extractDetailerReport(await api.loadPdf(bytes(f)));
