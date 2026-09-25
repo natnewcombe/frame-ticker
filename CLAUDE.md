@@ -145,18 +145,35 @@ Uses pdf.js 3.11.174 (loaded from cdnjs) to read the text layer, and pdf-lib
 
 ## Save Progress
 
-Currently an inline listener on `#btnSaveProgress`. It marks up only the
-report (`annotateDetailerPdf`: green band + OK on each ticked row) and uploads
-it as `IN PROGRESS: <num> - <NAME>.pdf`, named from the report's section title
-(`90_LB Walls` becomes `IN PROGRESS: 90 - LB WALLS.pdf`): a new attachment the
-first time, a new version of that file after. If Start Job was pressed, it
-then writes one `session_log` row with the frames ticked since then and their
-metres, and clears the session. Start Job on its own writes nothing.
+An inline listener on `#btnSaveProgress`. It marks up only the report
+(`annotateDetailerPdf`: green band + OK on each ticked row) and uploads it as a
+**new version of the original report attachment**, same name, never a fresh
+duplicate. (It used to upload a separate `IN PROGRESS: <num> - <NAME>.pdf`;
+those older uploads stay hidden by `IN_PROGRESS_ATTACHMENT_RE`.) If Start Job
+was pressed, it then writes one `session_log` row with the frames ticked since
+then and their metres, and clears the session. Start Job on its own writes
+nothing. Ported from Structural-Checklist PR #2.
 
-Planned: save as a new version of the original report instead, ported from
-Structural-Checklist PR #2 (clean-version tracking via the Worker account's
-`/users/me`, markup PDF keywords, NEW REVISION badge). Old IN PROGRESS files
-stay hidden.
+**Never work from the app's own markup**, or each save stacks new marks on old
+ones. So opening a job always goes back to a clean report version
+(`loadWorkingDetailer`):
+
+- App saves always come from the Worker token's Smartsheet account
+  (`/users/me`); designers upload revisions from their own logins. That's how
+  `pickWorkingVersion` tells the two apart in the version history
+  (`/sheets/{id}/attachments/{id}/versions`, via the Worker's `/api`
+  passthrough, so the Worker needs no extra route).
+- Each markup carries PDF keywords: `austruss-fc-markup fc-source:<id>
+  [fc-skip:<id>]`, naming the clean version it was drawn from and any newer
+  revision the bay chose not to switch to. The tag is deliberately different
+  from the structural app's `austruss-ssc-markup`. `cleanOf` follows the note
+  as a safety net whenever the history can't be trusted.
+- A designer version newer than the last save gets a NEW REVISION badge in the
+  "Which file is the detailer report?" picker, and opening the report asks:
+  keep working on the version you started, or switch. Ticks are kept by frame
+  name, so they carry over either way.
+- Drawings are never written by the app, so they always open at their latest
+  version.
 
 ## Known gaps
 
@@ -173,6 +190,9 @@ deliberate change to the test.
   Drawing.pdf`, flattened) can't be identified by any rule. The structural app
   shows a hint on such pages; not ported yet.
 - Uploads show as authored by whoever owns the Worker's token, not the operator.
+- If whoever owns the Worker's Smartsheet token also uploads reports from that
+  same login, the app will take those uploads for its own saves and skip them
+  as working versions. Designers must upload from their own accounts.
 
 ## Testing
 

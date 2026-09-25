@@ -51,8 +51,11 @@ const dom = new JSDOM(html, { runScripts: 'outside-only', pretendToBeVisual: tru
 const w = dom.window;
 const d = w.document;
 
+// PDF keywords the stubbed pdf.js reports for whatever is loaded next: how a
+// test says "this download is one of the app's own marked-up saves".
+let pdfKeywords = '';
 function fakePdf(pages){
-  return { numPages: pages, getPage: async () => ({
+  return { numPages: pages, getMetadata: async () => ({ info: { Keywords: pdfKeywords } }), getPage: async () => ({
     rotate: 0,
     getViewport: () => ({ width: 800, height: 600, convertToViewportPoint: (x, y) => [x, y] }),
     getTextContent: async () => ({ items: [] }),
@@ -74,7 +77,8 @@ process.on('unhandledRejection', e => runtimeErrors.push('unhandled rejection: '
 // list in step with the app: a name that disappears here is a rename to notice.
 const code = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map(x => x[1]).join('\n');
 const expose = '\n;Object.assign(window,{Store,AppState,CONFIG,renderJobList,renderFrameList,showScreen,' +
-               'setTabbarVisible,openJob,getWorkOrders,renderSessionList,updateSessionBar});';
+               'setTabbarVisible,openJob,getWorkOrders,renderSessionList,updateSessionBar,' +
+               'pickWorkingVersion,markupKeywords,parseMarkupKeywords,loadWorkingDetailer});';
 try{
   w.eval(code + expose);
 }catch(e){
@@ -130,12 +134,20 @@ check('no jobs shows empty state', !!d.querySelector('#jobListContainer .empty')
 console.log('\nopening a job: picking the report and drawings');
 const REPORT = '26040-LGS-3-600 [1] UNIT 5 - Detailer - Report - 90_LB Walls.pdf';
 const DRAWINGS = '26040-LGS-3-201 [3] UNIT 5 - Walls - 90mm - LB.pdf';
+const APP_EMAIL = 'app@austruss.com.au', DES = 'designer@austruss.com.au';
+const V = (id, day, who) => ({ id, createdAt: '2026-09-' + day + 'T00:00:00Z', createdBy: { email: who, name: who } });
 const calls = [];
 let rowAttachments = [];
+// Version history per attachment id. Anything not listed has one version,
+// uploaded by a designer.
+let versionsById = {};
 function route(url, opts){
   url = String(url);
   calls.push({ url, method: (opts && opts.method) || 'GET', body: opts && opts.body });
   const json = body => ({ ok: true, json: async () => body, text: async () => JSON.stringify(body) });
+  if(url.includes('/api/users/me')) return json({ email: APP_EMAIL });
+  const ver = url.match(/\/attachments\/(\d+)\/versions/);
+  if(ver) return json({ data: versionsById[ver[1]] || [V(+ver[1], '01', DES)] });
   if(url.includes('/rows/') && url.includes('/attachments')) return json({ data: rowAttachments });
   if(url.includes('/download')) return { ok: true, arrayBuffer: async () => new ArrayBuffer(8) };
   if(url.includes('/upload')) return json({ result: {} });
@@ -186,6 +198,8 @@ click(d.querySelectorAll('#modalList .pick-row')[0]);
 await waitFor(() => d.querySelectorAll('#frameList .frame-row').length === 3);
 const downloads = calls.filter(c => c.url.includes('/download')).map(c => new URL(c.url).searchParams.get('attachmentId'));
 check('with one file left, it is taken as the drawings: both downloaded', downloads.slice(-2).sort(), ['10', '11']);
+check('remembers which clean report version it works from',
+  w.eval('JSON.stringify(AppState.detailerSource)'), '{"sourceId":10,"skipId":null}');
 check('report screen shows every frame', d.querySelectorAll('#frameList .frame-row').length, 3);
 check('counts', [$('doneCount').textContent, $('totalCount').textContent], ['0', '3']);
 await waitFor(() => w.eval('AppState.drawingPages.length') === 3);
@@ -232,16 +246,21 @@ check('session start kept on the device with the frames done so far',
 check('Start Job alone writes nothing', calls.filter(c => c.method === 'POST').length, 0);
 click(rows()[1]);   // L501 done during the session
 
-w.eval('annotateDetailerPdf = async () => new Uint8Array([1, 2, 3]);');
-rowAttachments = [att(10, REPORT), att(11, DRAWINGS)];   // never saved before
+w.eval(`
+  annotateDetailerPdf = async () => new Uint8Array([1, 2, 3]);
+  PDFLib.PDFDocument = { load: async () => ({ setKeywords(k){ window.__keywords = k; }, save: async () => new Uint8Array([4]) }) };
+`);
+rowAttachments = [att(10, REPORT), att(11, DRAWINGS), att(12, 'IN PROGRESS: 90 - LB WALLS.pdf')];
 calls.length = 0;
 click($('btnSaveProgress'));
 await waitFor(() => $('btnSaveProgress').textContent === 'Save Progress' && !$('btnSaveProgress').disabled && calls.length);
 let uploads = calls.filter(c => c.url.includes('/upload'));
 let up = uploads[0] ? new URL(uploads[0].url).searchParams : new URLSearchParams();
 check('one upload', uploads.length, 1);
-check('first save: a new IN PROGRESS file named from the report section',
-  [up.get('mode'), up.get('rowId'), up.get('filename')], ['new', '1', 'IN PROGRESS: 90 - LB WALLS.pdf']);
+check('uploaded as a new version of the original report, same name',
+  [up.get('mode'), up.get('attachmentId'), up.get('filename')], ['version', '10', REPORT]);
+check('no IN PROGRESS file is created or updated', calls.some(c => decodeURIComponent(c.url).includes('IN PROGRESS')), false);
+check('markup is keyworded with its clean source', w.eval('JSON.stringify(window.__keywords)'), '["austruss-fc-markup","fc-source:10"]');
 const logCall = calls.find(c => c.url.includes('/rest/v1/session_log') && c.method === 'POST');
 const logged = logCall ? JSON.parse(logCall.body) : {};
 check('session logged to Supabase with only this session\'s frames',
@@ -251,17 +270,96 @@ check('and the job totals at this save', [logged.total_frames_done, logged.total
 check('session cleared after saving',
   [$('sessionStatus').style.display, w.localStorage.getItem('fc_session_1')], ['none', null]);
 
-// Second save: the IN PROGRESS file now exists, so it gets a new version.
-// Two with the same name: the newest is the live one.
-rowAttachments.push(att(54, 'IN PROGRESS: 90 - LB WALLS.pdf', '02'), att(55, 'IN PROGRESS: 90 - LB WALLS.pdf', '03'));
+// Second save: the first one bumped the report's version, which changes its
+// id. The live id is re-resolved by name just before writing.
+rowAttachments = [att(60, REPORT, '02'), att(11, DRAWINGS)];
 calls.length = 0;
 click($('btnSaveProgress'));
 await waitFor(() => $('btnSaveProgress').textContent === 'Save Progress' && !$('btnSaveProgress').disabled && calls.length);
 uploads = calls.filter(c => c.url.includes('/upload'));
 up = uploads[0] ? new URL(uploads[0].url).searchParams : new URLSearchParams();
-check('later saves: a new version of the latest IN PROGRESS file',
-  [up.get('mode'), up.get('attachmentId'), up.get('filename')], ['version', '55', 'IN PROGRESS: 90 - LB WALLS.pdf']);
+check('later saves: a new version of the report\'s live id, not the stale one',
+  [up.get('mode'), up.get('attachmentId'), up.get('filename')], ['version', '60', REPORT]);
+check('still keyworded with the clean source', w.eval('JSON.stringify(window.__keywords)'), '["austruss-fc-markup","fc-source:10"]');
 check('no session running: nothing logged', calls.some(c => c.url.includes('/rest/v1/session_log')), false);
+
+/* ------------------------------------------------ versions: which to use */
+console.log('\nversions: which report version to work from');
+const pick = (versions, note) => JSON.parse(w.eval('JSON.stringify((function(){' +
+  'var p = pickWorkingVersion(' + JSON.stringify(versions) + ',' + JSON.stringify(APP_EMAIL) + ',' + JSON.stringify(note) + ');' +
+  'return { base: p.base && p.base.id, newer: p.newer && p.newer.id, revised: p.revisedSinceSave }; })())'));
+check('never saved: works from the latest report',
+  pick([V(1,'01',DES), V(2,'02',DES)], null), { base: 2, newer: null, revised: false });
+check('after a save: back to the clean report, not the markup',
+  pick([V(1,'01',DES), V(2,'02',APP_EMAIL)], { sourceId: '1' }), { base: 1, newer: null, revised: false });
+check('designer revision after a save is offered and badged',
+  pick([V(1,'01',DES), V(2,'02',APP_EMAIL), V(3,'03',DES)], { sourceId: '1' }), { base: 1, newer: 3, revised: true });
+check('a declined revision is not offered again',
+  pick([V(1,'01',DES), V(2,'02',APP_EMAIL), V(3,'03',DES), V(4,'04',APP_EMAIL)], { sourceId: '1', skipId: '3' }), { base: 1, newer: null, revised: false });
+check('a revision switched to becomes the base',
+  pick([V(1,'01',DES), V(2,'02',APP_EMAIL), V(3,'03',DES), V(4,'04',APP_EMAIL)], { sourceId: '3' }), { base: 3, newer: null, revised: false });
+check('markup note unreadable: newest clean version before the last save',
+  pick([V(1,'01',DES), V(2,'02',APP_EMAIL)], null), { base: 1, newer: null, revised: false });
+check('markup keywords round-trip',
+  w.eval("JSON.stringify(parseMarkupKeywords(markupKeywords({sourceId:'1',skipId:'3'}).join(' ')))"), '{"sourceId":"1","skipId":"3"}');
+check('an ordinary PDF has no markup note', w.eval("parseMarkupKeywords('')"), null);
+check('the structural app\'s markups are not mistaken for ours',
+  w.eval("parseMarkupKeywords('austruss-ssc-markup ssc-source:5')"), null);
+
+/* ------------------------------------------ versions: opening after saves */
+console.log('\nversions: opening a report that has been saved');
+const reportDownloads = () => calls.filter(c => c.url.includes('/download')).map(c => new URL(c.url).searchParams.get('attachmentId'));
+const RPT = { id: 77, name: REPORT };
+// Latest version is our markup, drawn from version 70.
+versionsById = { 77: [V(70,'01',DES), V(77,'02',APP_EMAIL)] };
+pdfKeywords = 'austruss-fc-markup fc-source:70';
+calls.length = 0;
+w.eval("AppState.detailerSource = null");
+await w.eval('loadWorkingDetailer(' + JSON.stringify(RPT) + ')');
+check('reads the markup, then downloads the clean version it names', reportDownloads(), ['77', '70']);
+check('remembers which clean version it works from', w.eval('JSON.stringify(AppState.detailerSource)'), '{"sourceId":70,"skipId":null}');
+
+// Safety net: no version history, and the latest version is one of our
+// markups. Its note still leads back to the clean report.
+calls.length = 0;
+const normalFetch = w.fetch;
+w.fetch = async (url, opts) => { if(String(url).includes('/versions')) throw new Error('offline'); return route(url, opts); };
+await w.eval('loadWorkingDetailer(' + JSON.stringify(RPT) + ')');
+check('without version history, a markup still leads back to its clean source', reportDownloads(), ['77', '70']);
+w.fetch = normalFetch;
+
+// A designer uploaded a new revision (80) after our last save.
+versionsById = { 77: [V(70,'01',DES), V(77,'02',APP_EMAIL), V(80,'03',DES)] };
+async function openWithChoice(choice){
+  calls.length = 0;
+  pdfKeywords = 'austruss-fc-markup fc-source:70';
+  const done = w.eval('loadWorkingDetailer(' + JSON.stringify(RPT) + ')');
+  await waitFor(() => $('modalOverlay').classList.contains('show') && $('modalTitle').textContent.startsWith('New revision'));
+  const title = $('modalTitle').textContent;
+  pdfKeywords = '';   // the clean versions downloaded next are not markups
+  if(choice === 'cancel') click(d.querySelector('#modalSheet > .btn.outline'));
+  else click(d.querySelectorAll('#modalList .pick-row')[choice === 'switch' ? 1 : 0]);
+  await done;
+  return title;
+}
+check('a new revision asks the operator', await openWithChoice('keep'), 'New revision: ' + REPORT.replace(/\.pdf$/, ''));
+check('keep: stays on the version started, and remembers the declined one',
+  [reportDownloads().pop(), w.eval('JSON.stringify(AppState.detailerSource)')], ['70', '{"sourceId":70,"skipId":80}']);
+await openWithChoice('switch');
+check('switch: works from the new revision',
+  [reportDownloads().pop(), w.eval('JSON.stringify(AppState.detailerSource)')], ['80', '{"sourceId":80,"skipId":null}']);
+await openWithChoice('cancel');
+check('cancel counts as keep', w.eval('JSON.stringify(AppState.detailerSource)'), '{"sourceId":70,"skipId":80}');
+pdfKeywords = '';
+
+// The picker badges a report with a designer revision since the last save.
+rowAttachments = [att(77, REPORT), att(11, DRAWINGS)];
+w.eval("openJob({rowId:1, sheetId:2, workOrderId:'W-100', zone:'UNIT 5'})");
+await waitFor(() => !!d.querySelector('#modalList .pick-row .tag-chip'));
+check('NEW REVISION badge on the report in the picker',
+  [...d.querySelectorAll('#modalList .pick-row')].map(r => !!r.querySelector('.tag-chip')), [true, false]);
+w.eval('closeModal()');
+versionsById = {};
 
 /* ------------------------------------------------------------ sessions */
 console.log('\nsessions list');

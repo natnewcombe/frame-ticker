@@ -92,7 +92,7 @@ function loadParsers(){
   };
   const fn = new Function(...Object.keys(ctx), code + `
     return { CONFIG, loadPdf, extractDetailerReport, buildDrawingIndex,
-             annotateDetailerPdf, extractTags };`);
+             annotateDetailerPdf, extractTags, markupKeywords, parseMarkupKeywords };`);
   return fn(...Object.values(ctx));
 }
 
@@ -207,6 +207,32 @@ for(const job of jobs){
 Object.entries(IGNORED).forEach(([f, why]) => {
   if(!filter || f.toLowerCase().includes(filter)) console.log('\n=== ' + f + '  [skipped: ' + why + ']');
 });
+
+// Save Progress versions the original report, and the next open finds its
+// way back to the clean report through PDF keywords. Check that note survives
+// a real pdf-lib write and pdf.js read on a real marked-up report. Also check
+// that a markup still parses to every frame, as a second line of defence if
+// the app ever did read one (its marks would still stack on the next save).
+if(!filter){
+  const f = SAMPLES[SAMPLES.length - 1].report;
+  console.log('\n=== markup note round-trip  [' + f + ']');
+  try{
+    const { frames } = await api.extractDetailerReport(await api.loadPdf(bytes(f)));
+    const done = new Set(frames.slice(0, 3).map(fr => fr.name));
+    const doc = await PDFLib.PDFDocument.load(await api.annotateDetailerPdf(bytes(f), frames, done));
+    doc.setKeywords(api.markupKeywords({ sourceId: '123456', skipId: '789' }));
+    const markup = await doc.save();
+    const meta = await (await api.loadPdf(markup.slice())).getMetadata();
+    const note = api.parseMarkupKeywords(meta.info && meta.info.Keywords);
+    console.log('  read back: ' + JSON.stringify(note));
+    if(!note || note.sourceId !== '123456' || note.skipId !== '789') fail('markup note did not survive pdf-lib -> pdf.js');
+    const plain = await (await api.loadPdf(bytes(f))).getMetadata();
+    if(api.parseMarkupKeywords(plain.info && plain.info.Keywords)) fail('an untouched report reads as a markup');
+    const reread = (await api.extractDetailerReport(await api.loadPdf(markup.slice()))).frames.length;
+    console.log('  parsing the markup lists ' + reread + ' of ' + frames.length + ' frames');
+    if(reread !== frames.length) fail('reading a marked-up report loses frames');
+  }catch(e){ fail('markup round-trip threw: ' + e.message); }
+}
 
 console.log('\n' + jobs.length + ' job(s) checked, ' + failures + ' problem(s).');
 process.exit(failures ? 1 : 0);
