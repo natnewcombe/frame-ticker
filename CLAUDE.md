@@ -64,10 +64,10 @@ look there first for the fix.
 ## Smartsheet specifics
 
 - The job list has three buttons (`JOB_LISTS`), all over the Work Order sheet
-  `8417646009601924`, jobs in the report's own row order, only rows whose
-  Work Order Type is `FRAMECAD`:
+  `8417646009601924`, only rows whose Work Order Type is `FRAMECAD`:
   - **Scheduled** (default): `FRAMECAD - Work Orders Schedule`, ID
-    `7888733526249348` (`CONFIG.REPORT_ID`), minus rows marked Complete.
+    `7888733526249348` (`CONFIG.REPORT_ID`), minus rows marked Complete, in
+    the report's own row order.
   - **Not completed** / **Completed**: the **Work Order sheet itself**
     (`CONFIG.WORK_ORDER_SHEET_ID`), split on Complete, newest work order
     first. The bay asked for the sheet, not the `FRAMECAD - Work Orders`
@@ -197,7 +197,7 @@ ones. So opening a job always goes back to a clean report version
 - A designer version newer than the last save gets a NEW REVISION badge in the
   "Which file is the detailer report?" picker, and opening the report asks:
   keep working on the version you started, or switch. Ticks are kept by frame
-  name, so they carry over either way.
+  key (see identical frames above), so they carry over either way.
 - Drawings are never written by the app, so they always open at their latest
   version.
 

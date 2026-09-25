@@ -56,7 +56,9 @@ const SAMPLES = [
     drawings: '26040-LGS-3-201 [3] UNIT 5 - Walls - 90mm - LB.pdf' },
   { report: 'Report_75_Trusses_Zone 16.pdf',
     drawings: '26110-LGS-16-220 [C] ZONE 16 - Trusses.pdf' },
-  { report: '90mm STUDS REPORT.pdf', drawings: null }
+  { report: '90mm STUDS REPORT.pdf', drawings: null },
+  // W-13859 Calderwood: CA1007 listed 8 times, each ticked separately.
+  { report: '89 - LS BRIDGING - Report.pdf', drawings: null }
 ];
 // Kept in samples/ for later work, but the app doesn't open them yet.
 const IGNORED = {
@@ -218,7 +220,7 @@ Object.entries(IGNORED).forEach(([f, why]) => {
 // that a markup still parses to every frame, as a second line of defence if
 // the app ever did read one (its marks would still stack on the next save).
 if(!filter){
-  const f = SAMPLES[SAMPLES.length - 1].report;
+  const f = '90mm STUDS REPORT.pdf';
   console.log('\n=== markup note round-trip  [' + f + ']');
   try{
     const { frames } = await api.extractDetailerReport(await api.loadPdf(bytes(f)));
